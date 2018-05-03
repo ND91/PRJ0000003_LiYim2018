@@ -1,0 +1,750 @@
+---
+title: "eQTM_analyses"
+author: "Andrew Li Yim"
+date: "2/18/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+We previously performed separate analyse differential methylation and expression analyses. In the current workbook we would like to integrate the analyses to find targets that are potentially differentially methylated and expressed. The first step will be the correlation of the p-value distributions for the DMRs and DEGs yielding us genes that are differentially methylated and expressed (DMEG). We investigate DMRs for two reasons: 1) to cull the multiple test hypothesis, 2) we hypothesize that regions are biologically more relevant than positions. In the second step we will quantify the correlation of the previous DMEG. Given that not all samples were paired for methylation and expression we can only quantify the correlation for the paired data.  
+```{r setup}
+require(GenomicRanges)
+
+output_dir <- file.path("output", "03_integration")
+```
+
+```{r Methylation setup, echo = F}
+require(minfi)
+meth_dir <- file.path("output", "01_dna_methylation")
+
+gmset <- readRDS(file.path(meth_dir, "gmset", "GMset.Rds"))
+
+dmrs_CDvNon_CD_gr <- makeGRangesFromDataFrame(df = read.csv(file.path(meth_dir, "dmrs", "continuous", "CDvNon_CD", "CDvNon_CD_dmrs.csv")), keep.extra.columns = T)
+dmrs_INFvNINF_gr <- makeGRangesFromDataFrame(df = read.csv(file.path(meth_dir, "dmrs", "continuous", "INFvNINF", "INFvNINF_dmrs.csv")), keep.extra.columns = T)
+dmrs_STENvNINF_gr <- makeGRangesFromDataFrame(df = read.csv(file.path(meth_dir, "dmrs", "continuous", "STENvNINF", "STENvNINF_dmrs.csv")), keep.extra.columns = T)
+```
+
+```{r Gene expression setup}
+require(DESeq2)
+expr_dir <- file.path("output", "02_gene_expression")
+
+dds_intraCD <- readRDS(file.path(expr_dir, "preprocessing", "dds_intraCD.Rds"))
+rld <- rlog(dds_intraCD, blind = F)
+
+degs_CDvNon_CD <- read.csv(file.path(expr_dir, "top_genes", "CDvNon_CD", "DEGs_CDvNon_CD.csv"))
+degs_INFvNINF <- read.csv(file.path(expr_dir, "top_genes", "INFvNINF", "DEGs_INFvNINF.csv"))
+degs_STENvNINF <- read.csv(file.path(expr_dir, "top_genes", "STENvNINF", "DEGs_STENvNINF.csv"))
+```
+
+Integration of the p-values
+```{r p value integration}
+sumstats_dir <- file.path(output_dir, "pval_integration")
+dir.create(sumstats_dir)
+```
+
+```{r CDvNon_CD p-value integration}
+CDvNon_CD_sumstats_dir <- file.path(sumstats_dir, "CDvNon_CD")
+dir.create(CDvNon_CD_sumstats_dir)
+
+CDvNon_CD_olgenes <- intersect(dmrs_CDvNon_CD_gr$ENSEMBL, degs_CDvNon_CD$X)
+oldmrs_CDvNon_CD_gr <- dmrs_CDvNon_CD_gr[match(CDvNon_CD_olgenes, dmrs_CDvNon_CD_gr$ENSEMBL),]
+CDvNon_CD_sumstats <- data.frame(seqnames = as.character(seqnames(oldmrs_CDvNon_CD_gr)),
+                                 start = start(oldmrs_CDvNon_CD_gr),
+                                 end = end(oldmrs_CDvNon_CD_gr),
+                                 ENS = CDvNon_CD_olgenes,
+                                 DE = degs_CDvNon_CD[match(CDvNon_CD_olgenes, degs_CDvNon_CD$X), "pvalue"],
+                                 DM = dmrs_CDvNon_CD_gr[match(CDvNon_CD_olgenes, dmrs_CDvNon_CD_gr$ENSEMBL),]$Stouffer,
+                                 DE_sig = degs_CDvNon_CD[match(CDvNon_CD_olgenes, degs_CDvNon_CD$X), ]$padj < 0.05,
+                                 DM_sig = dmrs_CDvNon_CD_gr[match(CDvNon_CD_olgenes, dmrs_CDvNon_CD_gr$ENSEMBL), ]$Stouffer < 0.05)
+
+CDvNon_CD_sumstats$sig <- "NS"
+
+#DE
+de_index <- which(CDvNon_CD_sumstats$DE_sig == T & CDvNon_CD_sumstats$DM_sig == F)
+if(length(de_index) != 0){
+  CDvNon_CD_sumstats$sig[de_index] <- "DE"
+}
+#DM
+dm_index <- which(CDvNon_CD_sumstats$DE_sig == F & CDvNon_CD_sumstats$DM_sig == T)
+if(length(dm_index) != 0){
+  CDvNon_CD_sumstats$sig[dm_index] <- "DM"
+}
+#DME
+dme_index <- which(CDvNon_CD_sumstats$DE_sig == T & CDvNon_CD_sumstats$DM_sig == T)
+if(length(dme_index) != 0){
+  CDvNon_CD_sumstats$sig[dme_index] <- "DME"
+}
+CDvNon_CD_sumstats$sig <- factor(CDvNon_CD_sumstats$sig, levels = c("NS", "DM", "DE", "DME"))
+
+write.csv(CDvNon_CD_sumstats, file.path(CDvNon_CD_sumstats_dir, "CDvNon_CD_sumstats.csv"))
+
+require(ggplot2)
+require(Cairo)
+
+int_pvals_CDvNon_CD_obj <- ggplot(CDvNon_CD_sumstats, aes(x = -log10(DM), y = -log10(DE), col = sig)) +
+  geom_point() +
+  ggtitle("CD vs non-CD") +
+  scale_colour_discrete(drop = FALSE) +
+  xlim(0,30) +
+  ylim(0,20) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(face = "bold"))
+
+Cairo(file = file.path(CDvNon_CD_sumstats_dir, "CDvNon_CD_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_CDvNon_CD_obj)
+dev.off()
+```
+
+```{r INFvNINF p-value integration}
+INFvNINF_sumstats_dir <- file.path(sumstats_dir, "INFvNINF")
+dir.create(INFvNINF_sumstats_dir)
+
+INFvNINF_olgenes <- intersect(dmrs_INFvNINF_gr$ENSEMBL, degs_INFvNINF$X)
+oldmrs_INFvNINF_gr <- dmrs_INFvNINF_gr[match(INFvNINF_olgenes, dmrs_INFvNINF_gr$ENSEMBL),]
+INFvNINF_sumstats <- data.frame(seqnames = as.character(seqnames(oldmrs_INFvNINF_gr)),
+                                start = start(oldmrs_INFvNINF_gr),
+                                end = end(oldmrs_INFvNINF_gr),
+                                ENS = INFvNINF_olgenes,
+                                DE = degs_INFvNINF[match(INFvNINF_olgenes, degs_INFvNINF$X), "pvalue"],
+                                DM = dmrs_INFvNINF_gr[match(INFvNINF_olgenes, dmrs_INFvNINF_gr$ENSEMBL),]$Stouffer,
+                                DE_sig = degs_INFvNINF[match(INFvNINF_olgenes, degs_INFvNINF$X), ]$padj < 0.05,
+                                DM_sig = dmrs_INFvNINF_gr[match(INFvNINF_olgenes, dmrs_INFvNINF_gr$ENSEMBL), ]$Stouffer < 0.05)
+INFvNINF_sumstats$sig <- "NS"
+
+#DE
+de_index <- which(INFvNINF_sumstats$DE_sig == T & INFvNINF_sumstats$DM_sig == F)
+if(length(de_index) != 0){
+  INFvNINF_sumstats$sig[de_index] <- "DE"
+}
+#DM
+dm_index <- which(INFvNINF_sumstats$DE_sig == F & INFvNINF_sumstats$DM_sig == T)
+if(length(dm_index) != 0){
+  INFvNINF_sumstats$sig[dm_index] <- "DM"
+}
+#DME
+dme_index <- which(INFvNINF_sumstats$DE_sig == T & INFvNINF_sumstats$DM_sig == T)
+if(length(dme_index) != 0){
+  INFvNINF_sumstats$sig[dme_index] <- "DME"
+}
+INFvNINF_sumstats$sig <- factor(INFvNINF_sumstats$sig, levels = c("NS", "DM", "DE", "DME"))
+
+write.csv(INFvNINF_sumstats, file.path(INFvNINF_sumstats_dir, "INFvNINF_sumstats.csv"))
+
+require(ggplot2)
+require(Cairo)
+
+int_pvals_INFvNINF_obj <- ggplot(INFvNINF_sumstats, aes(x = -log10(DM), y = -log10(DE), col = sig)) +
+  geom_point() +
+  ggtitle("INF vs NINF") +
+  scale_colour_discrete(drop = FALSE) +
+  xlim(0,30) +
+  ylim(0,20) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(face = "bold"))
+
+Cairo(file = file.path(INFvNINF_sumstats_dir, "INFvNINF_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_INFvNINF_obj)
+dev.off()
+```
+
+```{r STENvNINF p-value integration}
+STENvNINF_sumstats_dir <- file.path(sumstats_dir, "STENvNINF")
+dir.create(STENvNINF_sumstats_dir)
+
+STENvNINF_olgenes <- intersect(dmrs_STENvNINF_gr$ENSEMBL, degs_STENvNINF$X)
+oldmrs_STENvNINF_gr <- dmrs_STENvNINF_gr[match(STENvNINF_olgenes, dmrs_STENvNINF_gr$ENSEMBL),]
+
+STENvNINF_sumstats <- data.frame(seqnames = as.character(seqnames(oldmrs_STENvNINF_gr)),
+                                 start = start(oldmrs_STENvNINF_gr),
+                                 end = end(oldmrs_STENvNINF_gr),
+                                 ENS = STENvNINF_olgenes,
+                                 DE = degs_STENvNINF[match(STENvNINF_olgenes, degs_STENvNINF$X), "pvalue"],
+                                 DM = dmrs_STENvNINF_gr[match(STENvNINF_olgenes, dmrs_STENvNINF_gr$ENSEMBL),]$Stouffer,
+                                 DE_sig = degs_STENvNINF[match(STENvNINF_olgenes, degs_STENvNINF$X), ]$padj < 0.05,
+                                 DM_sig = dmrs_STENvNINF_gr[match(STENvNINF_olgenes, dmrs_STENvNINF_gr$ENSEMBL), ]$Stouffer < 0.05)
+
+STENvNINF_sumstats$sig <- "NS"
+
+#DE
+de_index <- which(STENvNINF_sumstats$DE_sig == T & STENvNINF_sumstats$DM_sig == F)
+if(length(de_index) != 0){
+  STENvNINF_sumstats$sig[de_index] <- "DE"
+}
+#DM
+dm_index <- which(STENvNINF_sumstats$DE_sig == F & STENvNINF_sumstats$DM_sig == T)
+if(length(dm_index) != 0){
+  STENvNINF_sumstats$sig[dm_index] <- "DM"
+}
+#DME
+dme_index <- which(STENvNINF_sumstats$DE_sig == T & STENvNINF_sumstats$DM_sig == T)
+if(length(dme_index) != 0){
+  STENvNINF_sumstats$sig[dme_index] <- "DME"
+}
+STENvNINF_sumstats$sig <- factor(STENvNINF_sumstats$sig, levels = c("NS", "DM", "DE", "DME"))
+
+write.csv(STENvNINF_sumstats, file.path(STENvNINF_sumstats_dir, "STENvNINF_sumstats.csv"))
+
+require(ggplot2)
+require(Cairo)
+
+int_pvals_STENvNINF_obj <- ggplot(STENvNINF_sumstats, aes(x = -log10(DM), y = -log10(DE), col = sig)) +
+  geom_point() +
+  ggtitle("STEN vs NINF") +
+  xlim(0,30) +
+  ylim(0,20) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(face = "bold"))
+
+Cairo(file = file.path(STENvNINF_sumstats_dir, "STENvNINF_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_STENvNINF_obj)
+dev.off()
+```
+Only STENvNINF appears to generate DMEGs which we can utilise for further downstream analyses.
+
+```{r Annotations}
+require(biomaRt)
+enshsbm <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+listAttributes(enshsbm)$name[grep("entrez", listAttributes(enshsbm)$name)]
+ens2symbol <- getBM(attributes = c("ensembl_gene_id", "entrezgene", "hgnc_symbol", "chromosome_name", "start_position", "end_position"), mart = enshsbm)
+
+STENvNINF_DMEGs$entrez <- ens2symbol$entrezgene[match(STENvNINF_DMEGs$geneid, ens2symbol$ensembl_gene_id)]
+```
+
+```{r Enrichment of the DMEGs}
+require(limma)
+msigdb_dir <- file.path("~/hdd1/common_data/MSigDb")
+msigdb_c2 <- readRDS(file.path(msigdb_dir, "c2.all.v6.1.entrez.Rds"))
+```
+
+We will now perform an eQTM analysis.
+```{r eQTM analyses}
+eqtm_dir <- file.path(output_dir, "eqtms")
+dir.create(eqtm_dir)
+```
+
+```{r eQTM analyses}
+require(devtools)
+require(Gviz)
+install_github("nd91/eqtm")
+require(eqtm)
+require(doParallel)
+require(boot)
+require(foreach)
+
+#Generate overlapping samples IDs based on the code, the passage and the degree
+pData(gmset)$unique_id <- paste(pData(gmset)$Code, as.fumeric(pData(gmset)$Passage), pData(gmset)$Degree, sep = "_")
+colData(dds_intraCD)$unique_id <- paste(colData(dds_intraCD)$Code, colData(dds_intraCD)$Passage, colData(dds_intraCD)$Degree, sep = "_")
+
+gmset_rn <- gmset
+colnames(gmset_rn) <- pData(gmset_rn)$unique_id
+dds_rn <- dds_intraCD
+colnames(dds_rn) <- colData(dds_intraCD)$unique_id
+rld_rn <- rlog(dds_rn, blind = F)
+
+anno_gmset <- makeGRangesFromDataFrame(getAnnotation(gmset_rn), seqnames.field = "chr", start.field = "pos", end.field = "pos", keep.extra.columns = T)
+```
+
+```{r CDvNon_CD eQTM}
+eqtms_CDvNon_CD <- eqtm(dmrs_gr = dmrs_CDvNon_CD_gr, 
+                        gene_col = "ENSEMBL", 
+                        meth_data = getBeta(gmset_rn), 
+                        expr_data = assay(rld_rn), 
+                        meth_anno_gr = anno_gmset, 
+                        cor_method = "pearson", 
+                        alternative = "two.sided", 
+                        N = 10000, 
+                        iseed = 531235, 
+                        ncores = 8)
+mcols(eqtms_CDvNon_CD)$Symbol <- mcols(dmrs_CDvNon_CD_gr)[match(mcols(eqtms_CDvNon_CD)$geneid, mcols(dmrs_CDvNon_CD_gr)$ENSEMBL), "SYMBOL"]
+saveRDS(eqtms_CDvNon_CD, file = file.path(eqtm_dir, "eqtms_CDvNon_CD.Rds"))
+
+eqtms_CDvNon_CD_df <- topcor(eqtms_CDvNon_CD, sort.by = "CI95_diff")
+colnames(eqtms_CDvNon_CD_df)[6] <- "ENS"
+write.csv(eqtms_CDvNon_CD_df, file = file.path(eqtm_dir, "eqtms_CDvNon_CD.csv"))
+```
+
+```{r INFvNINF eQTM}
+eqtms_INFvNINF <- eqtm(dmrs_gr = dmrs_INFvNINF_gr, 
+                       gene_col = "ENSEMBL", 
+                       meth_data = getBeta(gmset_rn), 
+                       expr_data = assay(rld_rn), 
+                       meth_anno_gr = anno_gmset, 
+                       cor_method = "pearson", 
+                       alternative = "two.sided", 
+                       N = 10000, 
+                       iseed = 43123, 
+                       ncores = 8)
+mcols(eqtms_INFvNINF)$Symbol <- mcols(dmrs_INFvNINF_gr)[match(mcols(eqtms_INFvNINF)$geneid, mcols(dmrs_INFvNINF_gr)$ENSEMBL), "SYMBOL"]
+saveRDS(eqtms_INFvNINF, file = file.path(eqtm_dir, "eqtms_INFvNINF.Rds"))
+
+eqtms_INFvNINF_df <- topcor(eqtms_INFvNINF, sort.by = "CI95_diff")
+write.csv(eqtms_INFvNINF_df, file = file.path(eqtm_dir, "eqtms_INFvNINF.csv"))
+```
+
+```{r STENvNINF eQTM}
+eqtms_STENvNINF <- eqtm(dmrs_gr = dmrs_STENvNINF_gr, 
+                        gene_col = "ENSEMBL", 
+                        meth_data = getBeta(gmset_rn), 
+                        expr_data = assay(rld_rn), 
+                        meth_anno_gr = anno_gmset, 
+                        cor_method = "pearson", 
+                        alternative = "two.sided", 
+                        N = 10000, 
+                        iseed = 12343, 
+                        ncores = 8)
+
+mcols(eqtms_STENvNINF)$Symbol <- mcols(dmrs_STENvNINF_gr)[match(mcols(eqtms_STENvNINF)$geneid, mcols(dmrs_STENvNINF_gr)$ENSEMBL), "SYMBOL"]
+saveRDS(eqtms_STENvNINF, file = file.path(eqtm_dir, "eqtms_STENvNINF.Rds"))
+
+eqtms_STENvNINF_df <- topcor(eqtms_STENvNINF, sort.by = "CI95_diff")
+write.csv(eqtms_STENvNINF_df, file = file.path(eqtm_dir, "eqtms_STENvNINF.csv"))
+```
+
+As eQTM analyses correlates methylation and expression, additional factors (such as degree of CD), are less relevant.
+```{r All DMRs}
+# dmrs_total_gr <- c(dmrs_CDvNon_CD_gr, dmrs_INFvNINF_gr, dmrs_STENvNINF_gr)
+# dmrs_total_gr$Contrast <- c(rep("CDvNon_CD", length(dmrs_CDvNon_CD_gr)), rep("INFvNINF", length(dmrs_INFvNINF_gr)), rep("STENvNINF", length(dmrs_STENvNINF_gr)))
+# 
+# eqtms_total <- eqtm(dmrs_gr = dmrs_total_gr, 
+#                     gene_col = "ENSEMBL", 
+#                     meth_data = getBeta(gmset_rn), 
+#                     expr_data = assay(rld_rn), 
+#                     meth_anno_gr = anno_gmset, 
+#                     cor_method = "pearson", 
+#                     alternative = "two.sided", 
+#                     N = 1000, 
+#                     iseed = 679856, 
+#                     ncores = 8)
+# 
+# eqtms_total_df <- topcor(eqtms_total, sort.by = "CI95_diff")
+# eqtms_total_df$Symbol <- mcols(dmrs_total_gr)[match(eqtms_total_df$geneid, mcols(dmrs_total_gr)$ENSEMBL), "SYMBOL"]
+```
+
+```{r Integrate the p-value overlap and eQTM analyses}
+require(ggplot2)
+require(Cairo)
+```
+
+```{r CDvNon_CD}
+CDvNon_CD_sumstats_total <- merge(eqtms_CDvNon_CD_df, CDvNon_CD_sumstats, by = c("seqnames", "start", "end", "ENS"))
+
+Cairo(file = file.path(eqtm_dir, "CDvNon_CD_pval_integration_eqtms.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(CDvNon_CD_sumstats_total, aes(x = -log10(DM), y = -log10(DE), col = sig, alpha = -log10(pval))) +
+  geom_point() +
+  ggtitle("CD vs non-CD") +
+  scale_colour_discrete(drop = FALSE) +
+  xlim(0,30) +
+  ylim(0,15) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+dev.off()
+```
+
+```{r INFvNINF}
+INFvNINF_sumstats_total <- merge(eqtms_INFvNINF_df, 
+                                 INFvNINF_sumstats, 
+                                 by.x = c("seqnames", "start", "end", "geneid"),
+                                 by.y = c("seqnames", "start", "end", "ENS"))
+
+Cairo(file = file.path(eqtm_dir, "INFvNINF_pval_integration_eqtms.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(INFvNINF_sumstats_total, aes(x = -log10(DM), y = -log10(DE), col = sig, alpha = -log10(pval))) +
+  geom_point() +
+  ggtitle("INF vs NINF") +
+  scale_colour_discrete(drop = FALSE) +
+  xlim(0,30) +
+  ylim(0,15) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(face = "bold"))
+
+dev.off()
+```
+
+```{r STENvNINF}
+STENvNINF_sumstats_total <- merge(eqtms_STENvNINF_df, 
+                                  STENvNINF_sumstats,
+                                  by.x = c("seqnames", "start", "end", "geneid"),
+                                  by.y = c("seqnames", "start", "end", "ENS"))
+STENvNINF_sumstats_total$entrez <- rowData(rld_rn)$entrezgene[match(as.character(STENvNINF_sumstats_total$geneid), rowData(rld_rn)$ensembl_gene_id)]
+
+Cairo(file = file.path(eqtm_dir, "STENvNINF_pval_integration_eqtms.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(STENvNINF_sumstats_total, aes(x = -log10(DM), y = -log10(DE), col = sig, alpha = -log10(pval))) +
+  geom_point() +
+  ggtitle("STEN vs NINF") +
+  scale_colour_discrete(drop = FALSE) +
+  xlim(0,30) +
+  ylim(0,15) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+dev.off()
+```
+
+STENvNINF is the only comparison with genes that are significantly differentially methylated and differentially expressed. 
+```{r STENvNINF DMEGs distribution}
+STENvNINF_DMEGs <- STENvNINF_sumstats_total[STENvNINF_sumstats_total$sig == "DME",]
+write.csv(STENvNINF_DMEGs, file.path(eqtm_dir, "STENvNINF_DMEGs.csv"))
+#STENvNINF_DMEGs <- read.csv(file.path(eqtm_dir, "STENvNINF_DMEGs.csv"))
+
+hist(STENvNINF_DMEGs$cor_coef, breaks = 20)
+
+plotsymbols <- as.character(STENvNINF_DMEGs$Symbol)
+plotsymbols[which(STENvNINF_DMEGs$pval > 0.05)] <- ""
+
+require(ggrepel)
+
+Cairo(file = file.path(eqtm_dir, "STENvNINF_DMEGs_eQTMs.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(STENvNINF_DMEGs, aes(x = -log10(DM), y = -log10(DE), alpha = -log10(pval))) +
+  geom_point() +
+  geom_label_repel(label = plotsymbols, show.legend = F) +
+  ggtitle("STEN vs NINF: DMEGs") +
+  xlim(0,30) +
+  ylim(0,15) +
+  scale_colour_discrete(drop = FALSE) +
+  xlab(expression(paste("Methylation: ", -log[10], "(pvalue)"))) +
+  ylab(expression(paste("Expression: ", -log[10], "(pvalue)"))) +
+  theme_bw() +
+  theme(legend.position = "bottom") +
+  scale_fill_discrete(name=expression(paste("eQTM: ", -log[10], "(pvalue)")))
+dev.off()
+
+DMEQTM <- STENvNINF_DMEGs[which(STENvNINF_DMEGs$pval < 0.05),]
+```
+
+```{r DMEG enrichment}
+design_matrix <- model.matrix(~0 + Degree + Passage + Gender + Age + Medication, data = colData(dds_intraCD))
+contrast_matrix <- makeContrasts(
+  STENvNINF = DegreeSTEN-DegreeNINF,
+  levels = design_matrix
+)
+
+rld_DMEGs <- rld_rn[as.character(STENvNINF_DMEGs$geneid),]
+rownames(rld_DMEGs) <- rowData(rld_DMEGs)$entrezgene
+rld_DMEGs <- rld_DMEGs[!is.na(rownames(rld_DMEGs)),]
+
+DMEGs_camera_c2 <- camera(assay(rld_DMEGs), index = msigdb_c2[grep("(REACTOME|KEGG)", names(msigdb_c2))], design = design_matrix, contrast = contrast_matrix[,"STENvNINF"])
+```
+
+Are the DMEGs in particular overrepresented for ECM pathways relative to the other DEGs
+```{r DMEG ECM overrepresentation}
+STENvNINF_DMEGs$entrez <- rowData(rld_DMEGs)$entrezgene[match(as.character(STENvNINF_DMEGs$geneid), rowData(rld_DMEGs)$ensembl_gene_id)]
+
+ECM_pathways <- Reduce(union, msigdb_c2[grep("ECM", names(msigdb_c2))])
+
+#All
+pheatmap(assay(rld_rn)[which(rowData(rld_rn)$entrezgene %in% ECM_pathways),])
+
+#KEGG
+pheatmap(assay(rld_rn)[which(rowData(rld_rn)$entrezgene %in% msigdb_c2$KEGG_ECM_RECEPTOR_INTERACTION),])
+```
+
+##Induced network analyses (CPDB)
+By performing induced network analyses on CPDB, we observed two hubs forming. The hubs appeared to center around the genes PRKCA and E2F1. 
+```{r Network}
+cpdb_dir <- file.path(output_dir, "cpdb", "DMEG_pathways", "output")
+induced_modules <- read.csv(file.path(cpdb_dir, "Induced_Modules.txt"), sep = "\t", stringsAsFactors = F)
+
+induced_modules$interactorA_source <- NA
+induced_modules$interactorA_source[which(induced_modules$interactorA_name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "DMEG"
+induced_modules$interactorA_source[-which(induced_modules$interactorA_name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "CPDB"
+induced_modules$interactorB_source <- NA
+induced_modules$interactorB_source[which(induced_modules$interactorB_name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "DMEG"
+induced_modules$interactorB_source[-which(induced_modules$interactorB_name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "CPDB"
+
+write.table(induced_modules, file.path(cpdb_dir, "induced_modules_sourced.txt"), quote = F, sep = "\t", row.names = F)
+```
+
+Unfortunately CPDB does not provide the metadata for which genes were provided by them and which genes were provided in the seed list. 
+```{r Add source data}
+induced_modules_genes <- read.csv(file.path(cpdb_dir, "Induced_Module_Nodes.csv"), stringsAsFactors = F)
+induced_modules_genes$Source[which(induced_modules_genes$name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "Source"
+induced_modules_genes$Source[-which(induced_modules_genes$name %in% as.character(STENvNINF_DMEGs$Symbol))] <- "CPDB"
+write.csv(induced_modules_genes, file.path(cpdb_dir, "Induced_Modules_Nodes_Sourced.txt"))
+```
+Here we seek to ivnestigate whether PRKACA and E2F1 are transcriptionally differentially expressed.
+```{r PRKACA and E2F1}
+#PRKACA
+transcript_strip_plot("ENSG00000072062", assay(rld_rn), colData(rld_rn)$Degree, title = "PRKACA (ENSG00000072062)", y_lab = "Expr", type = "SE", legend = F)
+#E2F1
+transcript_strip_plot("ENSG00000101412", assay(rld_rn), colData(rld_rn)$Degree, title = "E2F1 (ENSG00000101412)", y_lab = "Expr", type = "SE", legend = F)
+```
+The expression data does not suggest any difference in expression. We therefore investigated whether their regulators/regulatees were differentially expressed in a similar fashion.
+```{r Up and downstream regulation of PRKACA and E2F1}
+PRKACA_upstream <- c("NKD1", "MBP", "ITPR1", "FGFR4", "FGFR1", "APOE", "ADCY5", "ACVRL1")
+PRKACA_downstream <- c("PPP1R1B", "SOX9", "PDE5A", "PDE4A", "GNAQ", "E2F1", "ZFP36L1", "SERPINF1", "PDE10A", "MBP", "ITPR1")
+E2F1_upstream <- c("PRKACA", "E2F7")
+E2F1_downstream <- c("ZFP36L1", "WNT2B", "SERPINF1", "MCAM", "FGFR1", "E2F7")
+
+hub_genes <- unique(c(PRKACA_upstream, PRKACA_downstream, E2F1_upstream, E2F1_downstream))
+hub_genes <- data.frame(symbol = hub_genes,
+                        ENS = rowData(rld_rn)$ensembl_gene_id[match(hub_genes, as.character(rowData(rld_rn)$hgnc_symbol))])
+
+presab_check <- function(gene, upstream, downstream){
+  if(gene %in% upstream & gene %in% downstream){
+    return("Up/down")
+  } else if(gene %in% upstream & !gene %in% downstream){
+    return("Up")
+  } else if(!gene %in% upstream & gene %in% downstream){
+    return("Down")
+  } else{
+    return("NR")
+  }
+}
+
+hubgenes_anno <- data.frame(PRKACA = sapply(hub_genes$symbol, presab_check, upstream = PRKACA_upstream, downstream = PRKACA_downstream),
+                            E2F1 = sapply(hub_genes$symbol, presab_check, upstream = E2F1_upstream, downstream = E2F1_downstream), row.names = hub_genes$symbol)
+samples_anno <- data.frame(Degree = as.character(colData(rld_rn)$Degree), row.names = colnames(rld_rn))
+
+#Cannot find PPP1R1B
+hub_genes <- hub_genes[!is.na(hub_genes$ENS),]
+hubgenes_anno <- hubgenes_anno[!is.na(hub_genes$ENS),]
+levels(hubgenes_anno$E2F1) <- levels(hubgenes_anno$PRKACA) <- c("Up", "Down", "Up/down", "NR")
+anno_col <- list(E2F1 = c("Up" = "#ff6961", #Red
+                          "Down" = "#1e90ff", #Blue
+                          "Up/down" = "#b19cd9", #Purple
+                          "NR" = "#DCDCDC"),
+                 PRKACA = c("Up" = "#ff6961", #Red
+                          "Down" = "#1e90ff", #Blue
+                          "Up/down" = "#b19cd9", #Purple
+                          "NR" = "#DCDCDC"))
+
+assay_hubgenes <- assay(rld_rn)[as.character(hub_genes$ENS),]
+rownames(assay_hubgenes) <- rownames(hub_genes_colData)
+
+pheatmap(mat = assay_hubgenes, annotation_row = hubgenes_anno, annotation_colors = anno_col, annotation_col = samples_anno)
+```
+
+4 (or 5 if APOE is included) genes appear to be similar: SERPINF1, WNT2B, MBP and FGFR4. Going back to the induced modules we observe that SERPINF1 and WNT2B are both regulated by the transcription factor E2F1. Similarly, MBP and FGFR4 appear to be involved in PRKACA, where FGFR4 acts as an enzyme towards PRKACA, whereas MBP shows a direct interaction with PRKACA.
+```{r Hub of interest}
+pheatmap(cor(t(assay_hubgenes)), 
+         display_numbers = T, 
+         annotation_row = hubgenes_anno,
+         annotation_col = hubgenes_anno,
+         annotation_colors = anno_col)
+
+interesting_nodes <- c("SERPINF1", "WNT2B", "MBP", "FGFR4", "APOE", "ACVRL1", "FGFR1", "ZFP36L1", "E2F7", "PRKACA", "E2F1")
+pheatmap(cor(t(assay_hubgenes[interesting_nodes,])))
+```
+
+```{r Figure Network analyses}
+#PRKACA
+PRKACA_plot <- transcript_strip_plot("ENSG00000072062", assay(rld_rn), colData(rld_rn)$Degree, title = "PRKACA (ENSG00000072062)", y_lab = "Expr", type = "SE", legend = F)
+#E2F1
+E2F1_plot <- transcript_strip_plot("ENSG00000101412", assay(rld_rn), colData(rld_rn)$Degree, title = "E2F1 (ENSG00000101412)", y_lab = "Expr", type = "SE", legend = F)
+
+Cairo(file = file.path(cpdb_dir, "B.pdf"), type = "pdf", units = "px", width = 1000, height = 600, dpi = 90, bg = "white")
+ggarrange(PRKACA_plot, E2F1_plot, nrow = 1, ncol = 2, align = "hv") 
+dev.off()
+
+Cairo(file = file.path(cpdb_dir, "C.pdf"), type = "pdf", units = "px", width = 1100, height = 1000, dpi = 90, bg = "white")
+pheatmap(cor(t(assay_hubgenes)), 
+         display_numbers = T, 
+         annotation_row = hubgenes_anno,
+         annotation_col = hubgenes_anno,
+         annotation_colors = anno_col)
+dev.off()
+
+```
+
+Are these genes differentially methylated?
+```{r interseting genes methylation}
+interesting_DMEGs <- STENvNINF_DMEGs[STENvNINF_DMEGs$Symbol %in% as.character(interesting_nodes),]
+write.csv(interesting_DMEGs, file.path(cpdb_dir, "Hub_genes_eQTM.csv"))
+#interesting_DMEGs <- read.csv(file.path(cpdb_dir, "Hub_genes_eQTM.csv"))[,-1]
+
+for(i in 1:nrow(interesting_DMEGs)){
+  Cairo(file = file.path(cpdb_dir, paste0(i, "_DMEG_", interesting_DMEGs$geneid[i], "_", interesting_DMEGs$Symbol[i], ".pdf")), type = "pdf", units = "px", width = 1200, height = 900, dpi = 90, bg = "white")
+  plot_eqtm(dmrs_se = eqtms_STENvNINF, 
+            meth_data = getBeta(gmset_rn), 
+            meth_groups = pData(gmset_rn)$Degree, 
+            anno_gr = anno_gmset, 
+            expr_data = assay(rld_rn), 
+            expr_groups = colData(rld_rn)$Degree, 
+            united_groups = united_groups, 
+            bm = ensembl, 
+            index = interesting_DMEGs$index[i])
+  dev.off()
+}
+```
+
+##DMEQTMs
+```{r DMEQTM Correlations}
+DMEQTM_cor <- cor(t(assay(rld_rn)[DMEQTM$geneid,]))
+rownames(DMEQTM_cor) <- colnames(DMEQTM_cor) <- DMEQTM$Symbol
+
+require(pheatmap)
+pheatmap(DMEQTM_cor)
+```
+
+```{r Visualization DMEQTMs}
+require(gridExtra)
+require(biomaRt)
+require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+require(NDlib)
+require(Gviz)
+require(reshape2)
+
+ensembl <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", host = "grch37.ensembl.org", path = "/biomart/martservice", dataset = "hsapiens_gene_ensembl")
+
+united_groups <- factor(gsub(".+_[0-9]_(.+)$", "\\1", colnames(eqtms_CDvNon_CD)), levels = c("Non_CD", "NINF", "INF", "STEN"))
+
+for(i in 1:nrow(DMEQTM)){
+  Cairo(file = file.path(eqtm_dir, paste0(i, "_DMEQTM", DMEQTM$geneid[i], "_", DMEQTM$Symbol[i], ".pdf")), type = "pdf", units = "px", width = 1200, height = 900, dpi = 90, bg = "white")
+  plot_eqtm(dmrs_se = eqtms_STENvNINF, 
+            meth_data = getBeta(gmset_rn), 
+            meth_groups = pData(gmset_rn)$Degree, 
+            anno_gr = anno_gmset, 
+            expr_data = assay(rld_rn), 
+            expr_groups = colData(rld_rn)$Degree, 
+            united_groups = united_groups, 
+            bm = ensembl, 
+            index = DMEQTM$index[i])
+  dev.off()
+}
+
+#plot_eqtm(dmrs_se = eqtms_STENvNINF, meth_data = getBeta(gmset_rn), meth_groups = pData(gmset_rn)$Degree, anno_gr = anno_gmset, expr_data = assay(rld_rn), expr_groups = colData(rld_rn)$Degree, united_groups = united_groups, bm = ensembl, index = 461)
+```
+
+Data for the manuscript
+```{r Manuscript data}
+manuscript_dir <- file.path("manuscript")
+figure_dir <- file.path(manuscript_dir, "figures")
+table_dir <- file.path(manuscript_dir, "tables")
+
+# Figure 4 Methylation expression integration
+figure_meth_expr_integration_dir <- file.path(figure_dir, "figure_4_Methylation_expression_integration")
+dir.create(figure_meth_expr_integration_dir)
+
+Cairo(file = file.path(figure_meth_expr_integration_dir, "CDvNon_CD_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_CDvNon_CD_obj)
+dev.off()
+
+Cairo(file = file.path(figure_meth_expr_integration_dir, "INFvNINF_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_INFvNINF_obj)
+dev.off()
+
+Cairo(file = file.path(figure_meth_expr_integration_dir, "STENvNINF_pval_integration.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(int_pvals_STENvNINF_obj)
+dev.off()
+
+# Figure 6 DMEG network
+figure_dmeg_network_dir <- file.path(figure_dir, "figure_6_DMEG_network")
+dir.create(figure_dmeg_network_dir)
+
+Cairo(file = file.path(figure_dmeg_network_dir, "PRKACA_E2F1.pdf"), type = "pdf", units = "px", width = 1000, height = 600, dpi = 90, bg = "white")
+ggarrange(PRKACA_plot, E2F1_plot, nrow = 1, ncol = 2, align = "hv") 
+dev.off()
+
+Cairo(file = file.path(figure_dmeg_network_dir, "Coexpression.pdf"), type = "pdf", units = "px", width = 1100, height = 1000, dpi = 90, bg = "white")
+pheatmap(cor(t(assay_hubgenes)), 
+         display_numbers = T, 
+         annotation_row = hubgenes_anno,
+         annotation_col = hubgenes_anno,
+         annotation_colors = anno_col)
+dev.off()
+
+# Figure S4 PRKACA/E2F1-associated DMEG summary plots
+figure_prkaca_e2f1_dmeg_plot_dir <- file.path(figure_dir, "figure_S4_PRKACA_E2F1_DMEG_summary_plots")
+dir.create(figure_prkaca_e2f1_dmeg_plot_dir)
+
+for(i in 1:nrow(interesting_DMEGs)){
+  Cairo(file = file.path(figure_prkaca_e2f1_dmeg_plot_dir, paste0(i, "_DMEG_", interesting_DMEGs$geneid[i], "_", interesting_DMEGs$Symbol[i], ".pdf")), type = "pdf", units = "px", width = 1200, height = 900, dpi = 90, bg = "white")
+  plot_eqtm(dmrs_se = eqtms_STENvNINF, 
+            meth_data = getBeta(gmset_rn), 
+            meth_groups = pData(gmset_rn)$Degree, 
+            anno_gr = anno_gmset, 
+            expr_data = assay(rld_rn), 
+            expr_groups = colData(rld_rn)$Degree, 
+            united_groups = united_groups, 
+            bm = ensembl, 
+            index = interesting_DMEGs$index[i])
+  dev.off()
+}
+
+# Table 3 PRKACA/E2F1-associated DMEGs
+table_prkaca_e2f1_dmeg_dir <- file.path(table_dir, "table_3_PRKACA_E2F1_DMEGs")
+dir.create(table_prkaca_e2f1_dmeg_dir)
+
+table_prkaca_e2f1_DMEGs <- data.frame(Coordinates = paste0(interesting_DMEGs$seqnames, ":", interesting_DMEGs$start, "-", interesting_DMEGs$end),
+                                nCpGs = interesting_DMEGs$nCpGs,
+                                Gene = interesting_DMEGs$Symbol,
+                                Ensembl = interesting_DMEGs$geneid,
+                                Entrez = interesting_DMEGs$entrez,
+                                Correlation = with(interesting_DMEGs, paste0(round(cor_coef, 2), " [", round(CI95_lower, 2), ", ", round(CI95_upper, 2), "]")),
+                                p_correlation = interesting_DMEGs$pval,
+                                p_DE = interesting_DMEGs$DE,
+                                p_DM = interesting_DMEGs$DM)
+                                
+
+require(openxlsx)
+wb <- createWorkbook()
+addWorksheet(wb, "PRKACA_E2F1_DMEGs")
+writeData(wb, "PRKACA_E2F1_DMEGs", table_prkaca_e2f1_DMEGs)
+saveWorkbook(wb, file = file.path(table_prkaca_e2f1_dmeg_dir, "PRKACA_E2F1_DMEGs.xlsx"), overwrite = TRUE)
+
+# Table S5 DMEGs
+table_dmeg_dir <- file.path(table_dir, "table_s6_DMEGs")
+dir.create(table_dmeg_dir)
+
+STENvNINF_DMEGs$entrez <- rowData(rld_DMEGs)$entrezgene[match(as.character(STENvNINF_DMEGs$geneid), rowData(rld_DMEGs)$ensembl_gene_id)]
+
+table_dmegs <- data.frame(Coordinates = paste0(STENvNINF_DMEGs$seqnames, ":", STENvNINF_DMEGs$start, "-", STENvNINF_DMEGs$end),
+                          nCpGs = STENvNINF_DMEGs$nCpGs,
+                          Gene = STENvNINF_DMEGs$Symbol,
+                          Ensembl = STENvNINF_DMEGs$geneid,
+                          Entrez = STENvNINF_DMEGs$entrez,
+                          Correlation = STENvNINF_DMEGs$cor_coef,
+                          Correlation_CI95_lower = STENvNINF_DMEGs$CI95_lower,
+                          Correlation_CI95_upper = STENvNINF_DMEGs$CI95_upper,
+                          p_correlation = STENvNINF_DMEGs$pval,
+                          p_DE = STENvNINF_DMEGs$DE,
+                          p_DM = STENvNINF_DMEGs$DM)
+
+table_dmegs <- table_dmegs[order(abs(table_dmegs$Correlation), decreasing = T),]
+
+require(openxlsx)
+wb <- createWorkbook()
+addWorksheet(wb, "DMEGs")
+writeData(wb, "DMEGs", table_dmegs)
+saveWorkbook(wb, file = file.path(table_dmeg_dir, "DMEGs.xlsx"), overwrite = TRUE)
+```
+
+```{r Final}
+sessionInfo()
+today <- gsub("^([0-9]{4})-([0-9]{2})-([0-9]{2}).+$", "\\1\\2\\3", Sys.time())
+
+rdata_dir <- file.path(output_dir, "rdata")
+dir.create(rdata_dir)
+save.image(file = file.path(output_dir, "rdata", paste0(today, ".RData")))
+```

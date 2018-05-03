@@ -1,0 +1,377 @@
+---
+title: "05_preproccessing_and_EDA"
+author: "Andrew Li Yim"
+date: "2/15/2018"
+output: html_document
+---
+
+RNAseq was performed on the Illumina NextSeq500 and the reads were aligned against the human GRCh38 genome and annotated using the Ensembl v91 annotations. Alignment was performed using the STAR aligner and genes were counted using featureCounts in the subread package. 
+```{r setup, include=FALSE}
+data_dir <- file.path("data/02_gene_expression")
+output_dir <- file.path("output/02_gene_expression")
+
+#Colorblind color palette
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+The first step is to import the raw count data and to process it
+```{r count processing}
+count_dir <- file.path(output_dir, "counts")
+gcounts_raw <- read.csv(file.path(count_dir, "counts.txt"), sep = "\t", stringsAsFactors = F, skip = 1)
+
+#Remove columns 2, 3, 4, 5, 6 as they are not necessary
+gcounts_proc <- gcounts_raw[,-c(2:6)]
+#Rename columns to something more readable
+colnames(gcounts_proc) <- gsub("^.+([0-9\\.]{14}).bam", "\\1", colnames(gcounts_proc))
+rownames(gcounts_proc) <- gcounts_proc$Geneid
+gcounts_proc <- gcounts_proc[,-1]
+
+#Remove features that do not have sufficient reads
+gcounts_proc <- gcounts_proc[rowSums(cpm(gcounts_proc)>1) >= 11,] 
+```
+
+We will perform DE analysis using DESeq2. First we must import the phenodata.
+```{r phenodata preparation}
+samples_dir <- file.path(data_dir, "samples")
+
+phenosheet <- read.csv(file.path(samples_dir, "samples_PROJ0000003_DEEXPRNA_V6.csv"), stringsAsFactors = F)
+#Replace the "-" in Sample_ID to "." to match the count data
+phenosheet$Sample_ID <- gsub("-", ".", phenosheet$Sample_ID)
+rownames(phenosheet) <- phenosheet$Sample_ID
+
+#Releveling
+phenosheet$Degree <- factor(x = phenosheet$Degree, levels = c("Non_CD", "NINF", "INF", "STEN")) 
+phenosheet$Phenotype <- factor(phenosheet$Phenotype, levels = c("Non_CD", "CD"))
+
+#Passage to integer
+require(rafalib)
+phenosheet$Passage <- as.numeric(gsub("P", "", phenosheet$Passage))
+
+#Gender to factor
+phenosheet$Gender <- as.factor(phenosheet$Gender)
+
+#Medication usage
+phenosheet$Medication <- NA
+medication_usage <- unique(c(which(phenosheet$Thiopurine == "Yes"), which(phenosheet$aTNF == "Yes")))
+phenosheet$Medication[medication_usage] <- T
+phenosheet$Medication[-medication_usage] <- F
+```
+
+Fix the age of NHC1 to 58 as was obtained from the methylation assay
+```{r NHC1 Age 58}
+phenosheet$Age[which(phenosheet$Code == "NHC1")] <- 58
+```
+
+Add the annotations
+```{r Annotations}
+require(biomaRt)
+enshsbm <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+listAttributes(enshsbm)$name[grep("entrez", listAttributes(enshsbm)$name)]
+ens2symbol <- getBM(attributes = c("ensembl_gene_id", "entrezgene", "hgnc_symbol", "chromosome_name", "start_position", "end_position"), mart = enshsbm)
+```
+
+##DEseq2
+Unfortunately DESeq2 does not allow for additive models, meaning we need to generate two DESeqDataSets to accommodate for that, namely the intra CD (CD vs Non_CD) and the inter CD (INF vs NINF and STEN vs NINF).
+```{r DEseq2 setup}
+require(DESeq2)
+require(edgeR)
+dds_intraCD <- DESeqDataSetFromMatrix(countData = gcounts_proc,
+                                      colData = phenosheet,
+                                      design = ~ Degree + Passage + Gender + Age + Medication)
+mcols(dds_intraCD) <- ens2symbol[match(rownames(gcounts_proc), ens2symbol$ensembl_gene_id),]
+
+dds_interCD <- DESeqDataSetFromMatrix(countData = gcounts_proc,
+                                      colData = phenosheet,
+                                      design = ~ Phenotype + Passage + Gender + Age + Medication)
+mcols(dds_interCD) <- ens2symbol[match(rownames(gcounts_proc), ens2symbol$ensembl_gene_id),]
+```
+
+###Exploratory data analysis
+```{r EDA}
+eda_dir <- file.path(output_dir, "EDA")
+dir.create(eda_dir)
+
+#Easier for plotting
+rld <- assay(rlog(dds_intraCD, blind = F))
+```
+
+Principal component analysis
+```{r PCA}
+rld_demeaned <- rld - rowMeans(rld)
+rld_svd <- svd(t(rld_demeaned))
+
+#Variance explained per PC
+var_per_PC <- rld_svd$d/sum(rld_svd$d)*100
+
+require(reshape2)
+var_per_PC_melt <- melt(var_per_PC)
+var_per_PC_melt <- cbind(var_per_PC_melt, rep(c(1:length(rld_svd$d)), 2))
+colnames(var_per_PC_melt) <- c("Variance", "PC")
+
+require(ggplot2)
+
+var_per_PC_plot <- ggplot(var_per_PC_melt, aes(x = PC, y = Variance, ymax = 0.15)) + 
+  geom_point(size = 3) +
+  theme_bw() +
+  ylim(0, 100) +
+  ylab("Percentage from total variance") +
+  ggtitle("Variance explained per PC") +
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12))
+
+Cairo(file = file.path(eda_dir, "variance_per_PC.pdf"), type = "pdf", units = "px", width = 1000, height = 1000, dpi = 90, bg = "white")
+print(var_per_PC_plot)
+dev.off()
+
+#PC1 and PC2
+svd_plot_df <- data.frame(PC1 = rld_svd$u[,1],
+                          PC2 = rld_svd$u[,2],
+                          Degree = colData(dds_intraCD)$Degree,
+                          Passage = colData(dds_intraCD)$Passage,
+                          Gender = colData(dds_intraCD)$Gender,
+                          Source = colData(dds_intraCD)$Code
+                          )
+require(Cairo)
+require(ggplot2)
+require(plotly)
+
+pca_plot_obj <- ggplot(svd_plot_df, aes(x = PC1, y = PC2, Degree = Degree, Passage = Passage, Gender = Gender, Source = Source)) + 
+  geom_point(aes(fill = Degree), color = "black", shape = 21, size = 5) +
+  scale_color_manual(values = cbPalette) +
+  theme_bw() +
+  ggtitle("PC1 vs PC2") +
+  xlim(-0.5, 0.5) +
+  ylim(-0.5, 0.5) +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+Cairo(file = file.path(eda_dir, "PCA.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(pca_plot_obj)
+dev.off()
+
+ggplotly(pca_plot_obj)
+```
+Similar to the methylation analyses, J47 appears to behave differently from the rest, implicating removal
+
+```{r J47 removal}
+dds_intraCD <- dds_intraCD[,colData(dds_intraCD)$Code != "J47"]
+rld <- rld[,colnames(dds_intraCD)]
+
+dds_interCD <- dds_interCD[,colData(dds_interCD)$Code != "J47"]
+```
+
+Heatmap of the top 300
+```{r Heatmap}
+require(matrixStats)
+rld_varsort <- rld[order(rowVars(rld), decreasing = T),]
+
+require(pheatmap)
+anno_col <- data.frame(Gender = colData(dds_intraCD)$Gender,
+                       Degree = colData(dds_intraCD)$Degree,
+                       Passage = colData(dds_intraCD)$Passage,
+                       Source = colData(dds_intraCD)$Code)
+rownames(anno_col) <- colnames(dds_intraCD)
+
+Cairo(file = file.path(eda_dir, "Heatmap_topvar300.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+pheatmap(mat = rld_varsort[1:300,], 
+         show_rownames = F,
+         annotation = anno_col)
+dev.off()
+```
+We observe several things: 
+- Sample J13_NINF_M_3 is a female sample as it expresses ENSG00000229807, which is Xist and can only be expressed by females. Similarly,  it does not express ENSG00000067048, which is DDX3Y a Y-linked gene. In conclusion: J13 NINF must be removed. 
+- There are certain gender features that are visible in the top 300 most variable genes. For this reason, as well as consistency with the methylation analyses, we will also remove the features located on the X and Y chromosomes.
+
+```{r Sex check}
+Cairo(file = file.path(eda_dir, "Heatmap_sex_chromosomes.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+pheatmap(rld[rowData(dds_intraCD)$chromosome_name %in% c("X", "Y"),], 
+         show_rownames = F,
+         annotation = anno_col)
+dev.off()
+
+colData(dds_intraCD)["102911.001.012",]
+```
+
+```{r J13 NINF P3 removal}
+dds_intraCD <- dds_intraCD[,-which(colnames(dds_intraCD) %in% "102911.001.012")]
+rld <- rld[,colnames(dds_intraCD)]
+
+dds_interCD <- dds_interCD[,-which(colnames(dds_interCD) %in% "102911.001.012")]
+```
+
+```{r Sample-sample correlation, echo = F}
+require(Cairo)
+require(rafalib)
+
+rld_cor <- cor(rld)
+rownames(rld_cor) <- colnames(rld_cor) <- with(colData(dds_intraCD), paste0(Code, "_", Degree, "_", Passage, "_", Gender))
+
+Cairo(file = file.path(eda_dir, "Correlation_matrix.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+pheatmap(rld_cor)
+dev.off()
+```
+
+```{r Sex genes removal}
+dds_intraCD <- dds_intraCD[!rowData(dds_intraCD)$chromosome_name %in% c("X", "Y"),]
+rld <- rld[rownames(dds_intraCD), colnames(dds_intraCD)]
+
+dds_interCD <- dds_interCD[!rowData(dds_interCD)$chromosome_name %in% c("X", "Y"),]
+```
+
+```{r PCA}
+rld_demeaned <- rld - rowMeans(rld)
+rld_svd <- svd(t(rld_demeaned))
+
+svd_plot_df <- data.frame(PC1 = rld_svd$u[,1],
+                          PC2 = rld_svd$u[,2],
+                          Degree = colData(dds_intraCD)$Degree,
+                          Passage = colData(dds_intraCD)$Passage,
+                          Gender = colData(dds_intraCD)$Gender,
+                          Source = colData(dds_intraCD)$Code
+                          )
+require(Cairo)
+require(ggplot2)
+require(plotly)
+
+pca_plot_obj <- ggplot(svd_plot_df, aes(x = PC1, y = PC2, Degree = Degree, Passage = Passage, Gender = Gender, Source = Source)) + 
+  geom_point(aes(fill = Degree), color = "black", shape = 21, size = 5) +
+  scale_color_manual(values = cbPalette) +
+  theme_bw() +
+  ggtitle("Expression") +
+  xlim(-0.5, 0.5) +
+  ylim(-0.5, 0.5) +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+Cairo(file = file.path(eda_dir, "PCA_culled.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(pca_plot_obj)
+dev.off()
+
+ggplotly(pca_plot_obj)
+```
+The PCA looks better now, but no clear separation could be observed for NINF and STEN as was visible when looking at the methylation data. In the next chunk, we aim to investigate which factors correlate strongly with the different PCs.
+```{r PCA correlations}
+require(NDlib)
+require(rafalib)
+
+#Degree
+rld_svd_degree <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Degree, padj.method = "bonferroni")
+
+degree_svd_df <- data.frame(PC1 = rld_svd$u[,1], Degree = colData(dds_intraCD)$Degree)
+ggplot(degree_svd_df, aes(x = Degree, y = PC1)) +
+  geom_boxplot() + 
+  geom_jitter() +
+  theme_bw()
+
+#Gender
+rld_svd_gender <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Gender, padj.method = "bonferroni")
+
+gender_svd_df <- data.frame(PC2 = rld_svd$u[,2], Gender = colData(dds_intraCD)$Gender)
+ggplot(gender_svd_df, aes(x = Gender, y = PC2)) +
+  geom_boxplot() + 
+  geom_jitter() +
+  theme_bw()
+
+#Passage
+rld_svd_passage <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Passage, padj.method = "bonferroni")
+
+passage_svd_df <- data.frame(PC2 = rld_svd$u[,2], Passage = as.fumeric(as.character(colData(dds_intraCD)$Passage)))
+ggplot(passage_svd_df, aes(x = Passage, y = PC2)) +
+  geom_point() +
+  theme_bw()
+
+#Smoking
+rld_svd_smoking <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Smoking)
+
+#Medication usage
+rld_svd_medication <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Medication)
+
+#Age
+rld_svd_age <- SVD_correlator(SVD = rld_svd$u, confounder = colData(dds_intraCD)$Age)
+
+```
+
+As passage and degree appear to be the most interesting variables, we will look at their correlation with the principal components
+```{r PC Degree and Passage}
+svd_correlations_plot_df <- data.frame(Correlation = c(rld_svd_degree[[1]]$Correlation, 
+                                                     rld_svd_gender[[1]]$Correlation,
+                                                     rld_svd_age[[1]]$Correlation,
+                                                     rld_svd_passage[[1]]$Correlation,
+                                                     rld_svd_medication[[1]]$Correlation),
+                                     Factor = rep(c("Degree", "Gender", "Age", "Passage", "Medication"), each = nrow(rld_svd_degree[[1]])),
+                                     PC = rep(1:nrow(rld_svd_degree[[1]]), 5)
+                                     )
+
+svd_correlations_obj <- ggplot(svd_correlations_plot_df, aes(x = PC, y = Correlation, shape = Factor)) + 
+  geom_point(aes(fill = Factor), color = "black", shape = 21, size = 4) +
+  theme_bw() +
+  ggtitle("Expression") +
+  geom_hline(yintercept = 0) +
+  ylim(-1, 1) +
+  xlab("PC") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+Cairo(file = file.path(eda_dir, "SVD_expression_correlations.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(svd_correlations_obj)
+dev.off()
+```
+
+Save dgList for downstream processing
+```{r save dgList}
+preprocessing_dir <- file.path(output_dir, "preprocessing")
+dir.create(preprocessing_dir)
+
+saveRDS(dds_intraCD, file.path(preprocessing_dir, "dds_intraCD.Rds"))
+saveRDS(dds_interCD, file.path(preprocessing_dir, "dds_interCD.Rds"))
+```
+
+Data for the manuscript
+```{r Manuscript data}
+manuscript_dir <- file.path("manuscript")
+figure_dir <- file.path(manuscript_dir, "figures")
+table_dir <- file.path(manuscript_dir, "tables")
+
+#Figure 1 PCA methylation and expression
+figure_pca_dir <- file.path(figure_dir, "figure_1_PCA_methylation_and_expression")
+dir.create(figure_pca_dir)
+
+Cairo(file = file.path(figure_pca_dir, "PCA_expression.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(pca_plot_obj)
+dev.off()
+
+#Figure S1 SVD correlations
+figure_pca_correlations_dir <- file.path(figure_dir, "figure_S1_SVD_correlations")
+dir.create(figure_pca_correlations_dir)
+
+Cairo(file = file.path(figure_pca_correlations_dir, "SVD_expression_correlations.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(svd_correlations_obj)
+dev.off()
+```
+
+```{r Final}
+sessionInfo()
+today <- gsub("^([0-9]{4})-([0-9]{2})-([0-9]{2}).+$", "\\1\\2\\3", Sys.time())
+
+rdata_dir <- file.path(output_dir, "rdata")
+dir.create(rdata_dir)
+save.image(file = file.path(output_dir, "rdata", paste0(today, ".RData")))
+```

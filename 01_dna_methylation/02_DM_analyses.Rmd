@@ -1,0 +1,924 @@
+---
+title: "DM_analyses"
+author: "Andrew Li Yim"
+date: "February 12, 2018"
+output: html_document
+---
+Previously, we performed quality control and exploratory data analyses. After having removed some samples and CpGs due to either QC failure or irregular clustering according to EDA, we will now perform differential methylation analyses. From the PCA, we observed that CD and HC do not appear to separate on the first few principal components, however STEN samples are somewhat separable from the NINF samples. 
+
+```{r setup, echo = F}
+#Project data
+data_dir <- file.path("data", "01_dna_methylation")
+output_dir <- file.path("output", "01_dna_methylation")
+
+#Common data
+idat_dir <- file.path(data_dir, "idat")
+samples_dir <- file.path(data_dir, "samples")
+common_dir <- file.path("~/hdd1/common_data")
+```
+
+Import previous results
+```{r Previous output}
+require(minfi)
+gmset <- readRDS(file.path(output_dir, "gmset", "GMset.Rds"))
+
+mvals <- getM(gmset)
+betas <- getBeta(gmset)
+anno <- makeGRangesFromDataFrame(df = getAnnotation(gmset), seqnames.field = "chr", start.field = "pos", end.field = "pos", keep.extra.columns = T)
+```
+
+Generate a column in the sample data to include medication (aTNF and/or Thiopurine) usage
+```{r Medication usage}
+pData(gmset)$Medication <- NA
+medication_usage <- unique(c(which(pData(gmset)$Thiopurine == "Yes"), which(pData(gmset)$aTNF == "Yes")))
+pData(gmset)$Medication[medication_usage] <- T
+pData(gmset)$Medication[-medication_usage] <- F
+```
+
+# MSigDb pathways
+```{r MSigDb}
+require(ggplot2)
+
+gene_enrichplot <- function(width, genes, n = 10){
+  plot_df <- data.frame(width = width/1000, genes = genes)[1:n,]
+  ggplot(plot_df, aes(x = genes, y = width)) +
+    geom_bar(stat = "identity") +
+    scale_x_discrete(limits=rev(plot_df$genes)) +
+    theme_bw() +
+    ylab("Summed DMR width (kbps)") +
+    theme(axis.title.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size = 14, face = "bold"),
+          axis.text = element_text(size = 12), 
+          legend.title = element_text(size = 14, face = "bold"),
+          legend.text = element_text(size = 12)) +
+    coord_flip()
+}
+
+pathway_enrichplot <- function(results, n = 10){
+  data_df <- results[1:n,]
+  pathwayid <- with(data_df, paste0(Description, " (", Geneset.ID, ")"))
+  pathwayid_wrapped <- sapply(X = pathwayid, FUN = function(x){
+    paste(strwrap(x,width=20), collapse="\n")
+  }, simplify = T)
+  
+  plot_df <- data.frame(pathway = pathwayid_wrapped,
+                        logpval = -log10(data_df$P.value),
+                        Significant = factor(ifelse(data_df$FDR < 0.05, T, F), levels = c(T, F)),
+                        gene_set_ratio = with(data_df, N.Geneset.Peak.Genes/N.Geneset.Genes)
+                        )
+  
+  ggplot(plot_df, aes(x = pathway, y = logpval, size = gene_set_ratio)) +
+    geom_point(aes(col = Significant)) +
+    scale_x_discrete(limits=rev(plot_df$pathway)) +
+    theme_bw() +
+    ylab("-log10(p)") +
+    theme(axis.title.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title.x = element_text(size = 14, face = "bold"),
+          axis.text.x = element_text(size = 12), 
+          legend.title = element_text(size = 14, face = "bold"),
+          legend.text = element_text(size = 12)) +
+    guides(size=guide_legend(title="Gene set ratio")) +
+    scale_colour_hue(drop = FALSE) +
+    coord_flip() +
+    ylim(0, NA) 
+}
+
+pathway_enrichplot_facet <- function(results_hyper, results_hypo, n = 10){
+  data_df <- rbind(results_hyper[1:n,], results_hypo[1:n,])
+  data_df$direction <- rep(c("Hypermethylated", "Hypomethylated"), each = n)
+  pathwayid <- with(data_df, paste0(Description, " (", Geneset.ID, ")"))
+  pathwayid_wrapped <- sapply(X = pathwayid, FUN = function(x){
+    paste(strwrap(x,width=20), collapse="\n")
+  }, simplify = T)
+  
+  plot_df <- data.frame(pathway = pathwayid_wrapped,
+                        logpval = -log10(data_df$P.value),
+                        Significant = factor(ifelse(data_df$FDR < 0.05, T, F), levels = c(T, F)),
+                        gene_set_ratio = with(data_df, N.Geneset.Peak.Genes/N.Geneset.Genes),
+                        direction = data_df$direction
+                        )
+  
+  ggplot(plot_df, aes(x = pathway, y = logpval, size = gene_set_ratio)) +
+    geom_point(aes(col = Significant)) +
+    scale_x_discrete(limits=rev(plot_df$pathway)) +
+    theme_bw() +
+    facet_grid(. ~ direction, scale = "free_y") +
+    ylab("-log10(p)") +
+    theme(axis.title.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title = element_text(size = 14, face = "bold"),
+          axis.text = element_text(size = 12), 
+          legend.title = element_text(size = 14, face = "bold"),
+          legend.text = element_text(size = 12)) +
+    guides(size=guide_legend(title="Gene set ratio")) +
+    scale_colour_hue(drop = FALSE) +
+    coord_flip() +
+    ylim(0, NA) 
+}
+
+```
+
+
+# Differential methylation analyses
+We will perform differential methylation analyses using the limma package. In this part, the design is rather important. We would want to generate the following three comparisons:
+- CD vs non-CD
+- INF vs NINF
+- STEN vs NINF
+Besides the aforementioned comparisons, we would want to correct for age, medicine usage and passage. Here we would want to perform two types of analyses: 
+1) Using passage as continuous variable.
+2) Only investigating passage 3 and 4 as most samples are derived from this group.
+
+```{r setup}
+dmp_dir <- file.path(output_dir, "dmps")
+dir.create(dmp_dir)
+dmr_dir <- file.path(output_dir, "dmrs")
+dir.create(dmr_dir)
+```
+
+## Passage as a continuous variable
+In this setup, we will use passage as a continuous variable. This allows in a certain sense for greater power without having to make the assumption that P3 and P4 are similar or the passages of interest. 
+
+```{r Passage: Continuous covariate}
+condmp_dir <- file.path(dmp_dir, "continuous")
+dir.create(condmp_dir)
+condmr_dir <- file.path(dmr_dir, "continuous")
+dir.create(condmr_dir)
+
+require(limma)
+require(rafalib)
+
+design_continuous <- model.matrix(~0 + Degree + as.fumeric(Passage) + as.factor(Gender) + Age + Medication, data = pData(gmset))
+colnames(design_continuous)[1:8] <- c("Non_CD", "NINF", "INF", "STEN", "Passage", "Male", "Age", "Medication")
+colnames(design_continuous) <- gsub("-", "_", colnames(design_continuous))
+
+contrast_continuous <- makeContrasts(
+  CDvNon_CD = (INF+NINF+STEN)/3-Non_CD, #CD vs non-CD
+  INFvNINF = INF-NINF, #INF vs NINF
+  STENvNINF = STEN-NINF, #STEN vs NINF 
+  levels = design_continuous
+)
+
+#M-values
+mvals_continuous_file <- file.path(condmp_dir, "mvals_fit_continuous.Rds")
+if(file.exists(mvals_continuous_file)){
+  mvals_fit_continuous <- readRDS(mvals_continuous_file)
+} else{
+  mvals_dupcor_continuous <- duplicateCorrelation(object = mvals, design = design_continuous, block = pData(gmset)$Code)
+  mvals_fit_continuous <- lmFit(mvals, design = design_continuous, block =  pData(gmset)$Code, correlation = mvals_dupcor_continuous$consensus)
+  mvals_fit_continuous <- contrasts.fit(fit = mvals_fit_continuous, contrasts = contrast_continuous)
+  mvals_fit_continuous <- eBayes(mvals_fit_continuous)
+  saveRDS(mvals_fit_continuous, file.path(dmp_dir, "mvals_fit_continuous.Rds"))
+}
+
+#Beta-values
+betas_continuous_file <- file.path(condmp_dir, "betas_fit_continuous.Rds")
+if(file.exists(betas_continuous_file)){
+  betas_fit_continuous <- readRDS(betas_continuous_file)
+} else{
+  betas_dupcor_continuous <- duplicateCorrelation(object = betas, design = design_continuous, block = pData(gmset)$Code)
+  betas_fit_continuous <- lmFit(betas, design = design_continuous, block = pData(gmset)$Code, correlation = betas_dupcor_continuous$consensus)
+  betas_fit_continuous <- contrasts.fit(fit = betas_fit_continuous, contrasts = contrast_continuous)
+  betas_fit_continuous <- eBayes(betas_fit_continuous)
+  saveRDS(betas_fit_continuous, file.path(dmp_dir, "betas_fit_continuous.Rds"))
+}
+```
+
+```{r DMP: CD vs non-CD}
+CDvNon_CD_dmp_dir <- file.path(condmp_dir, "CDvNon_CD")
+dir.create(CDvNon_CD_dmp_dir)
+
+CDvNon_CD_top <- topTable(fit = mvals_fit_continuous, coef = "CDvNon_CD", number = "Inf", adjust.method = "BH")
+CDvNon_CD_top <- cbind(CDvNon_CD_top, 
+                       Beta = betas_fit_continuous$coefficient[rownames(CDvNon_CD_top), "CDvNon_CD"],
+                       anno[rownames(CDvNon_CD_top),])
+CDvNon_CD_top_sig <- CDvNon_CD_top[CDvNon_CD_top$adj.P.Val < 0.05,]
+
+write.csv(CDvNon_CD_top, file.path(CDvNon_CD_dmp_dir, "CDvNon_CD_top.csv"))
+write.csv(CDvNon_CD_top_sig, file.path(CDvNon_CD_dmp_dir, "CDvNon_CD_top_sig.csv"))
+
+#Volcano plot
+require(NDlib)
+require(Cairo)
+
+Cairo(file = file.path(CDvNon_CD_dmp_dir, "CDvNon_CD_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = CDvNon_CD_top$Beta, 
+             pvals = CDvNon_CD_top$P.Value,
+             significance = CDvNon_CD_top$adj.P.Val<0.05,
+             identifiers = rownames(CDvNon_CD_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "CD vs Non_CD",
+             top_names = 10)
+dev.off()
+
+#Plotting
+for(i in 1:10){
+  Cairo(file = file.path(CDvNon_CD_dmp_dir, paste0(i, "_", rownames(CDvNon_CD_top)[i], "_", CDvNon_CD_top$UCSC_RefGene_Name[i], ".pdf")), 
+        type = "pdf", 
+        units = "px", 
+        width = 800, 
+        height = 800, 
+        dpi = 90, 
+        bg = "white")
+  print(cpg_strip_plot(cpg_num = rownames(CDvNon_CD_top)[i], 
+                       betas = betas, 
+                       type = "SE",
+                       factor_interest = pData(gmset)$Phenotype))
+  dev.off()
+}
+```
+
+```{r DMP: CD INF vs CD NINF}
+INFvNINF_dmp_dir <- file.path(condmp_dir, "INFvNINF")
+dir.create(INFvNINF_dmp_dir)
+
+INFvNINF_top <- topTable(fit = mvals_fit_continuous, coef = "INFvNINF", number = "Inf", adjust.method = "BH")
+INFvNINF_top <- cbind(INFvNINF_top, 
+                      Beta = betas_fit_continuous$coefficient[rownames(INFvNINF_top), "INFvNINF"],
+                      anno[rownames(INFvNINF_top),])
+INFvNINF_top_sig <- INFvNINF_top[INFvNINF_top$adj.P.Val < 0.05,]
+
+write.csv(INFvNINF_top, file.path(INFvNINF_dmp_dir, "INFvNINF_top.csv"))
+write.csv(INFvNINF_top_sig, file.path(INFvNINF_dmp_dir, "INFvNINF_top_sig.csv"))
+
+#Volcano plot
+require(NDlib)
+require(Cairo)
+
+Cairo(file = file.path(INFvNINF_dmp_dir, "INFvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = INFvNINF_top$Beta, 
+             pvals = INFvNINF_top$P.Value,
+             significance = INFvNINF_top$adj.P.Val<0.05,
+             identifiers = rownames(INFvNINF_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "INF vs NINF",
+             top_names = 10)
+dev.off()
+
+#Plotting
+for(i in 1:10){
+  Cairo(file = file.path(INFvNINF_dmp_dir, paste0(i, "_", rownames(INFvNINF_top)[i], "_", INFvNINF_top$UCSC_RefGene_Name[i], ".pdf")), 
+        type = "pdf", 
+        units = "px", 
+        width = 800, 
+        height = 800, 
+        dpi = 90, 
+        bg = "white")
+  print(cpg_strip_plot(cpg_num = rownames(INFvNINF_top)[i], 
+                       betas = betas, 
+                       type = "SE",
+                       factor_interest = pData(gmset)$Degree))
+  dev.off()
+}
+```
+
+```{r DMP: CD STEN vs CD NINF}
+STENvNINF_dmp_dir <- file.path(condmp_dir, "STENvNINF")
+dir.create(STENvNINF_dmp_dir)
+
+STENvNINF_top <- topTable(fit = mvals_fit_continuous, coef = "STENvNINF", number = "Inf", adjust.method = "BH")
+STENvNINF_top <- cbind(STENvNINF_top, 
+                       Beta = betas_fit_continuous$coefficient[rownames(STENvNINF_top), "STENvNINF"],
+                       anno[rownames(STENvNINF_top),])
+STENvNINF_top_sig <- STENvNINF_top[STENvNINF_top$adj.P.Val < 0.05,]
+
+write.csv(STENvNINF_top, file.path(STENvNINF_dmp_dir, "STENvNINF_top.csv"))
+write.csv(STENvNINF_top_sig, file.path(STENvNINF_dmp_dir, "STENvNINF_top_sig.csv"))
+
+#Volcano plot
+require(NDlib)
+require(Cairo)
+
+Cairo(file = file.path(STENvNINF_dmp_dir, "STENvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = STENvNINF_top$Beta, 
+             pvals = STENvNINF_top$P.Value,
+             significance = STENvNINF_top$adj.P.Val<0.05,
+             identifiers = rownames(STENvNINF_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "STEN vs NINF",
+             top_names = 10)
+dev.off()
+
+#Plotting
+for(i in 1:10){
+  Cairo(file = file.path(STENvNINF_dmp_dir, paste0(i, "_", rownames(STENvNINF_top)[i], "_", STENvNINF_top$UCSC_RefGene_Name[i], ".pdf")), 
+        type = "pdf", 
+        units = "px", 
+        width = 800, 
+        height = 800, 
+        dpi = 90, 
+        bg = "white")
+  print(cpg_strip_plot(cpg_num = rownames(STENvNINF_top)[i], 
+                       betas = betas, 
+                       type = "SE",
+                       factor_interest = pData(gmset)$Degree))
+  dev.off()
+}
+```
+
+```{r Effect size distribution}
+DMP_effect_sizes <- data.frame(Comparison = c(rep(paste0("CDvNon_CD (", length(CDvNon_CD_top_sig$Beta), ")"), length(CDvNon_CD_top_sig$Beta)),
+                                              rep(paste0("INFvNINF (", length(INFvNINF_top_sig$Beta), ")"), length(INFvNINF_top_sig$Beta)),
+                                              rep(paste0("STENvNINF (", length(STENvNINF_top_sig$Beta), ")"), length(STENvNINF_top_sig$Beta))), 
+                               Beta = abs(c(CDvNon_CD_top_sig$Beta, INFvNINF_top_sig$Beta, STENvNINF_top_sig$Beta))
+                               )
+
+require(ggplot2)
+Cairo(file = "DMP_effect_sizes.pdf", type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(DMP_effect_sizes, aes(x = factor(Comparison), y = Beta, fill = Comparison)) +
+  #geom_jitter(col = "grey") +
+  geom_violin() +
+  ylim(c(0,1)) +
+  coord_flip() +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12), 
+        axis.title.y = element_blank(),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12),
+        legend.position="none")
+dev.off()
+```
+
+Which genes are particularly enriched?
+```{r DMP: gene enrichment}
+CDvNon_CD_symbols <- unlist(lapply(CDvNon_CD_top_sig$GencodeCompV12_NAME, function(i){
+  unique(unlist(strsplit(x = i, split = ";")))
+}))
+
+INFvNINF_symbols <- unlist(lapply(INFvNINF_top_sig$GencodeCompV12_NAME, function(i){
+  unique(unlist(strsplit(x = i, split = ";")))
+}))
+
+STENvNINF_symbols <- unlist(lapply(STENvNINF_top_sig$GencodeCompV12_NAME, function(i){
+  unique(unlist(strsplit(x = i, split = ";")))
+}))
+
+anno_symbols <- unlist(lapply(anno$GencodeCompV12_NAME, function(i){
+  unique(unlist(strsplit(x = i, split = ";")))
+}))
+
+gencode_gene_count <- sort(table(unlist(anno_symbols)))
+
+fish_wrapper <- function(feature_interesting, feature_counts, features_interesting, features_counts){
+  feature_background <- feature_counts-feature_interesting
+  all_interesting <- features_interesting-feature_counts
+  all_background <- features_counts-features_interesting-feature_counts-feature_interesting
+  
+  fish_mat <- matrix(c(feature_interesting, feature_background, all_interesting, all_background), nrow = 2, byrow = T)
+  
+  fishtest <- fisher.test(fish_mat)
+  return(fishtest$p.value)
+}
+
+#CDvNon_CD
+CDvNon_CD_symbol_count <- sort(table(CDvNon_CD_symbols))
+CDvNon_CD_perc_sig <- CDvNon_CD_symbol_count/gencode_gene_count[rownames(CDvNon_CD_symbol_count)]
+CDvNon_CD_enrichment <- data.frame(Gene = names(CDvNon_CD_symbol_count), 
+                                   DMPs = as.vector(CDvNon_CD_symbol_count), 
+                                   Total_CpGs = as.vector(gencode_gene_count[rownames(CDvNon_CD_symbol_count)]),
+                                   Proportion = as.vector(CDvNon_CD_perc_sig))
+write.csv(CDvNon_CD_enrichment, file.path(CDvNon_CD_dmp_dir, "CDvNon_CD_symbol_enrichment.csv"))
+
+#INFvNINF
+INFvNINF_symbol_count <- sort(table(INFvNINF_symbols))
+INFvNINF_perc_sig <- INFvNINF_symbol_count/gencode_gene_count[rownames(INFvNINF_symbol_count)]
+INFvNINF_enrichment <- data.frame(Gene = names(INFvNINF_symbol_count), 
+                                   DMPs = as.vector(INFvNINF_symbol_count), 
+                                   Total_CpGs = as.vector(gencode_gene_count[rownames(INFvNINF_symbol_count)]),
+                                   Proportion = as.vector(INFvNINF_perc_sig))
+write.csv(INFvNINF_enrichment, file.path(INFvNINF_dmp_dir, "INFvNINF_symbol_enrichment.csv"))
+
+#STENvNINF
+STENvNINF_symbol_count <- sort(table(STENvNINF_symbols))
+STENvNINF_perc_sig <- STENvNINF_symbol_count/gencode_gene_count[rownames(STENvNINF_symbol_count)]
+STENvNINF_enrichment <- data.frame(Gene = names(STENvNINF_symbol_count), 
+                                   DMPs = as.vector(STENvNINF_symbol_count), 
+                                   Total_CpGs = as.vector(gencode_gene_count[rownames(STENvNINF_symbol_count)]),
+                                   Proportion = as.vector(STENvNINF_perc_sig))
+write.csv(STENvNINF_enrichment, file.path(STENvNINF_dmp_dir, "STENvNINF_symbol_enrichment.csv"))
+```
+
+Which features are enriched?
+```{r DMP feature enrichment}
+#Total EPIC features
+all_features <- gsub("^$", "Intergenic", anno$GencodeCompV12_Group)
+all_features <- table(unlist(lapply(all_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+
+#CDvNon_CD
+CDvNon_CD_all_features <- gsub("^$", "Intergenic", CDvNon_CD_top_sig$GencodeCompV12_Group)
+CDvNon_CD_all_features <- table(unlist(lapply(CDvNon_CD_all_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+CDvNon_CD_all_features_prop <- CDvNon_CD_all_features/all_features[names(CDvNon_CD_all_features)]
+
+##Hypomethylation
+CDvNon_CD_hypo_features <-  gsub("^$", "Intergenic", CDvNon_CD_top_sig[which(CDvNon_CD_top_sig$Beta < 0),"GencodeCompV12_Group"])
+CDvNon_CD_hypo_features <- table(unlist(lapply(CDvNon_CD_hypo_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+CDvNon_CD_hypo_features_prop <- CDvNon_CD_hypo_features/all_features[names(CDvNon_CD_hypo_features)]
+##Hypermethylation
+CDvNon_CD_hyper_features <- gsub("^$", "Intergenic", CDvNon_CD_top_sig[which(CDvNon_CD_top_sig$Beta > 0),"GencodeCompV12_Group"])
+CDvNon_CD_hyper_features <- table(unlist(lapply(CDvNon_CD_hyper_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+CDvNon_CD_hyper_features_prop <- CDvNon_CD_hyper_features/all_features[names(CDvNon_CD_hyper_features)]
+
+CDvNon_CD_features_df <- data.frame(row.names = names(CDvNon_CD_all_features),
+                                   Hypo_DMPs_n = as.vector(CDvNon_CD_hypo_features),
+                                   Hypo_proportion = as.vector(CDvNon_CD_hypo_features_prop),
+                                   Hyper_DMPs_n = as.vector(CDvNon_CD_hyper_features),
+                                   Hyper_proportion = as.vector(CDvNon_CD_hyper_features_prop),
+                                   Total_DMPs_n = as.vector(CDvNon_CD_all_features),
+                                   Total_proportion = as.vector(CDvNon_CD_all_features_prop),
+                                   Background_n = as.vector(all_features[names(CDvNon_CD_hyper_features)]))
+
+write.csv(CDvNon_CD_features_df, file.path(CDvNon_CD_dir, "feature_proportions.csv"))
+
+#INFvNINF
+INFvNINF_all_features <- gsub("^$", "Intergenic", INFvNINF_top_sig$GencodeCompV12_Group)
+INFvNINF_all_features <- table(unlist(lapply(INFvNINF_all_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+INFvNINF_all_features_prop <- INFvNINF_all_features/all_features[names(INFvNINF_all_features)]
+
+##Hypomethylation
+INFvNINF_hypo_features <-  gsub("^$", "Intergenic", INFvNINF_top_sig[which(INFvNINF_top_sig$Beta < 0),"GencodeCompV12_Group"])
+INFvNINF_hypo_features <- table(unlist(lapply(INFvNINF_hypo_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+INFvNINF_hypo_features_prop <- INFvNINF_hypo_features/all_features[names(INFvNINF_hypo_features)]
+##Hypermethylation
+INFvNINF_hyper_features <- gsub("^$", "Intergenic", INFvNINF_top_sig[which(INFvNINF_top_sig$Beta > 0),"GencodeCompV12_Group"])
+INFvNINF_hyper_features <- table(unlist(lapply(INFvNINF_hyper_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+INFvNINF_hyper_features_prop <- INFvNINF_hyper_features/all_features[names(INFvNINF_hyper_features)]
+
+INFvNINF_features_df <- data.frame(row.names = names(INFvNINF_all_features),
+                                   Hypo_DMPs_n = as.vector(INFvNINF_hypo_features),
+                                   Hypo_proportion = as.vector(INFvNINF_hypo_features_prop),
+                                   Hyper_DMPs_n = as.vector(INFvNINF_hyper_features),
+                                   Hyper_proportion = as.vector(INFvNINF_hyper_features_prop),
+                                   Total_DMPs_n = as.vector(INFvNINF_all_features),
+                                   Total_proportion = as.vector(INFvNINF_all_features_prop),
+                                   Background_n = as.vector(all_features[names(INFvNINF_hyper_features)]))
+
+write.csv(INFvNINF_features_df, file.path(INFvNINF_dir, "feature_proportions.csv"))
+
+#STENvNINF
+STENvNINF_all_features <- gsub("^$", "Intergenic", STENvNINF_top_sig$GencodeCompV12_Group)
+STENvNINF_all_features <- table(unlist(lapply(STENvNINF_all_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+STENvNINF_all_features_prop <- STENvNINF_all_features/all_features[names(STENvNINF_all_features)]
+
+##Hypomethylation
+STENvNINF_hypo_features <-  gsub("^$", "Intergenic", STENvNINF_top_sig[which(STENvNINF_top_sig$Beta < 0),"GencodeCompV12_Group"])
+STENvNINF_hypo_features <- table(unlist(lapply(STENvNINF_hypo_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+STENvNINF_hypo_features_prop <- STENvNINF_hypo_features/all_features[names(STENvNINF_hypo_features)]
+##Hypermethylation
+STENvNINF_hyper_features <- gsub("^$", "Intergenic", STENvNINF_top_sig[which(STENvNINF_top_sig$Beta > 0),"GencodeCompV12_Group"])
+STENvNINF_hyper_features <- table(unlist(lapply(STENvNINF_hyper_features, function(x){
+  unique(unlist(strsplit(x, ";")))
+})))
+STENvNINF_hyper_features_prop <- STENvNINF_hyper_features/all_features[names(STENvNINF_hyper_features)]
+
+STENvNINF_features_df <- data.frame(row.names = names(STENvNINF_all_features),
+                                   Hypo_DMPs_n = as.vector(STENvNINF_hypo_features),
+                                   Hypo_proportion = as.vector(STENvNINF_hypo_features_prop),
+                                   Hyper_DMPs_n = as.vector(STENvNINF_hyper_features),
+                                   Hyper_proportion = as.vector(STENvNINF_hyper_features_prop),
+                                   Total_DMPs_n = as.vector(STENvNINF_all_features),
+                                   Total_proportion = as.vector(STENvNINF_all_features_prop),
+                                   Background_n = as.vector(all_features[names(STENvNINF_hyper_features)]))
+
+write.csv(STENvNINF_features_df, file.path(STENvNINF_dir, "feature_proportions.csv"))
+```
+
+```{r DMP pathway enrichment}
+require(missMethyl)
+require(BiasedUrn)
+
+#CDvNon_CD
+GO_CDvNon_CD <- gometh(sig.cpg = rownames(CDvNon_CD_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "GO",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+GO_CDvNon_CD <- GO_CDvNon_CD[order(GO_CDvNon_CD$P.DE),]
+GO_CDvNon_CD_sig <- GO_CDvNon_CD[GO_CDvNon_CD$FDR < 0.05,]
+
+KEGG_CDvNon_CD <- gometh(sig.cpg = rownames(CDvNon_CD_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "KEGG",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+KEGG_CDvNon_CD <- KEGG_CDvNon_CD[order(KEGG_CDvNon_CD$P.DE),]
+KEGG_CDvNon_CD_sig <- KEGG_CDvNon_CD[KEGG_CDvNon_CD$FDR < 0.05,]
+
+#INFvNINF
+GO_INFvNINF <- gometh(sig.cpg = rownames(INFvNINF_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "GO",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+GO_INFvNINF <- GO_INFvNINF[order(GO_INFvNINF$P.DE),]
+GO_INFvNINF_sig <- GO_INFvNINF[GO_INFvNINF$FDR < 0.05,]
+
+KEGG_INFvNINF <- gometh(sig.cpg = rownames(INFvNINF_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "KEGG",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+KEGG_INFvNINF <- KEGG_INFvNINF[order(KEGG_INFvNINF$P.DE),]
+KEGG_INFvNINF_sig <- KEGG_INFvNINF[KEGG_INFvNINF$FDR < 0.05,]
+
+#STENvNINF
+GO_STENvNINF <- gometh(sig.cpg = rownames(STENvNINF_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "GO",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+GO_STENvNINF <- GO_STENvNINF[order(GO_STENvNINF$P.DE),]
+GO_STENvNINF_sig <- GO_STENvNINF[GO_STENvNINF$FDR < 0.05,]
+
+KEGG_STENvNINF <- gometh(sig.cpg = rownames(STENvNINF_top_sig), 
+                       all.cpg = rownames(mvals), 
+                       collection = "KEGG",
+                       plot.bias = T, 
+                       prior.prob = T, 
+                       array.type = "EPIC")
+KEGG_STENvNINF <- KEGG_STENvNINF[order(KEGG_STENvNINF$P.DE),]
+KEGG_STENvNINF_sig <- KEGG_STENvNINF[KEGG_STENvNINF$FDR < 0.05,]
+```
+
+```{r Calling DMRs}
+require(DMRcate)
+require(biomaRt)
+
+#Transcript to Gene
+ensbm <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl")
+
+#CpGs and annotation within each DMR
+dmr2anno <- function(dmr, biomart){
+  transcript.gene <- getBM(attributes = c("ensembl_transcript_id", "ensembl_gene_id"), mart = biomart)
+  
+  dmrs.dmps <- cpgs_within_region(chr = as.character(seqnames(dmr)), annotation.gr = anno, start_region = start(dmr), end_region = end(dmr))
+  dmrs.dmps.df <- as.data.frame(dmrs.dmps)
+
+  dmrs.dmps.anno <- unique(data.frame(symbols = unlist(strsplit(dmrs.dmps.df[,"GencodeCompV12_NAME"], ";")), 
+                                      feature = unlist(strsplit(dmrs.dmps.df[,"GencodeCompV12_Group"], ";")), 
+                                      transcript = gsub("(ENST[0-9]+)\\.[0-9]+", "\\1",unlist(strsplit(dmrs.dmps.df[,"GencodeCompV12_Accession"], ";")))))
+  transcript2gene <- transcript.gene[which(transcript.gene$ensembl_transcript_id %in% as.character(dmrs.dmps.anno$transcript)),]
+  rownames(transcript2gene) <- transcript2gene$ensembl_transcript_id
+  dmrs.dmps.anno$ensembl_gene <- transcript2gene[as.character(dmrs.dmps.anno$transcript),"ensembl_gene_id"]
+  
+  #The following code needs to be removed if we want to use transcripts rather than genes
+  dmrs.dmps.anno.gene <- unique(dmrs.dmps.anno[,c("symbols", "feature", "ensembl_gene")])
+  
+  cpgs <- paste(names(dmrs.dmps), sep = "", collapse = ";")
+  symbol <- paste(as.character(dmrs.dmps.anno.gene$symbols), collapse = ";")
+  feature <- paste(as.character(dmrs.dmps.anno.gene$feature), collapse = ";")
+  ensembl_gene <- paste(as.character(dmrs.dmps.anno.gene$ensembl_gene), collapse = ";")
+  return(list(symbol, feature, ensembl_gene, cpgs))
+}
+```
+
+```{r DMR: CD vs non-CD}
+CDvNon_CD_dmr_dir <- file.path(condmr_dir, "CDvNon_CD")
+dir.create(CDvNon_CD_dmr_dir)
+
+cpg_anno_CDvNon_CD_continuous <- cpg.annotate(object = mvals,
+                                              datatype = "array",
+                                              arraytype = "EPIC",
+                                              what = "M",
+                                              analysis.type = "differential",
+                                              design = design_continuous,
+                                              contrasts = T,
+                                              cont.matrix = contrast_continuous,
+                                              coef = "CDvNon_CD")
+dmrs_CDvNon_CD_continuous <- dmrcate(cpg_anno_CDvNon_CD_continuous, lambda = 1000, C = 2, min.cpgs = 3, mc.cores = 8, pcutoff = 0.05)
+dmrs_CDvNon_CD_continuous_gr <- extractRanges(dmrs_CDvNon_CD_continuous, genome = "hg19")
+
+require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+require(ChIPseeker)
+dmrs_CDvNon_CD_continuous_gr <- as.GRanges(annotatePeak(peak = dmrs_CDvNon_CD_continuous_gr, 
+                                                     TxDb = TxDb.Hsapiens.UCSC.hg19.knownGene,
+                                                     annoDb = "org.Hs.eg.db"))
+
+write.csv(as.data.frame(dmrs_CDvNon_CD_continuous_gr), file.path(CDvNon_CD_dmr_dir, "CDvNon_CD_dmrs.csv"))
+#dmrs_CDvNon_CD_continuous_gr <- makeGRangesFromDataFrame(read.csv(file.path(CDvNon_CD_dmr_dir, "CDvNon_CD_dmrs.csv")), keep.extra.columns = T)
+dmrs_sig_CDvNon_CD_continuous_gr <- dmrs_CDvNon_CD_continuous_gr[dmrs_CDvNon_CD_continuous_gr$Stouffer < 0.05,]
+
+for(i in 1:10){
+  Cairo(file = file.path(CDvNon_CD_dmr_dir, paste0(i, "_", gsub("[:-]", "_", dmrs_CDvNon_CD_continuous_gr[i,]), ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  dmr_genome_plot(chr = as.character(seqnames(dmrs_CDvNon_CD_continuous_gr[i,])), 
+                  betas = betas, 
+                  annotation.gr = anno, 
+                  factor_interest = pData(gmset)$Degree, 
+                  plotgrid = F,
+                  start_dmr = start(dmrs_CDvNon_CD_continuous_gr[i,]), 
+                  end_dmr = end(dmrs_CDvNon_CD_continuous_gr[i,]))
+  dev.off()
+}
+
+#Enrichment
+##Gene
+dmrs_sig_CDvNon_CD_continuous_gene <- split(dmrs_sig_CDvNon_CD_continuous_gr, as.character(dmrs_sig_CDvNon_CD_continuous_gr$SYMBOL))
+dmrs_sig_CDvNon_CD_continuous_width <- sort(unlist(lapply(dmrs_sig_CDvNon_CD_continuous_gene, function(dmr) sum(width(dmr)))), decreasing = T)
+head(dmrs_sig_CDvNon_CD_continuous_width, n = 10)
+
+CDvNon_CD_gene_plot <- gene_enrichplot(width = dmrs_sig_CDvNon_CD_continuous_width, genes = names(dmrs_sig_CDvNon_CD_continuous_width))
+
+##Pathway
+dmrs_sig_CDvNon_CD_continuous_hyper_gr <- dmrs_sig_CDvNon_CD_continuous_gr[dmrs_sig_CDvNon_CD_continuous_gr$meanbetafc > 0,]
+dmrs_sig_CDvNon_CD_continuous_hypo_gr <- dmrs_sig_CDvNon_CD_continuous_gr[dmrs_sig_CDvNon_CD_continuous_gr$meanbetafc < 0,]
+
+dmrs_sig_CDvNon_CD_continuous_hyper_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_CDvNon_CD_continuous_hyper_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+dmrs_sig_CDvNon_CD_continuous_hypo_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_CDvNon_CD_continuous_hypo_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+
+CDvNon_CD_hyperplot <- pathway_enrichplot(results = dmrs_sig_CDvNon_CD_continuous_hyper_enr$results, n = 10)
+CDvNon_CD_hypoplot <- pathway_enrichplot(results = dmrs_sig_CDvNon_CD_continuous_hypo_enr$results, n = 10)
+```
+
+```{r DMR: CD INF vs CD NINF}
+INFvNINF_dmr_dir <- file.path(condmr_dir, "INFvNINF")
+dir.create(INFvNINF_dmr_dir)
+
+cpg_anno_INFvNINF_continuous <- cpg.annotate(object = mvals,
+                                              datatype = "array",
+                                              arraytype = "EPIC",
+                                              what = "M",
+                                              analysis.type = "differential",
+                                              design = design_continuous,
+                                              contrasts = T,
+                                              cont.matrix = contrast_continuous,
+                                              coef = "INFvNINF")
+dmrs_INFvNINF_continuous <- dmrcate(cpg_anno_INFvNINF_continuous, lambda = 1000, C = 2, min.cpgs = 3, mc.cores = 8, pcutoff = 0.05)
+dmrs_INFvNINF_continuous_gr <- extractRanges(dmrs_INFvNINF_continuous, genome = "hg19")
+
+#Annotate DMRs
+require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+require(ChIPseeker)
+dmrs_INFvNINF_continuous_gr <- as.GRanges(annotatePeak(peak = dmrs_INFvNINF_continuous_gr, 
+                                                     TxDb = TxDb.Hsapiens.UCSC.hg19.knownGene,
+                                                     annoDb = "org.Hs.eg.db"))
+
+write.csv(as.data.frame(dmrs_INFvNINF_continuous_gr), file.path(INFvNINF_dmr_dir, "INFvNINF_dmrs.csv"))
+#dmrs_INFvNINF_continuous_gr <- makeGRangesFromDataFrame(read.csv(file.path(INFvNINF_dmr_dir, "INFvNINF_dmrs.csv")), keep.extra.columns = T)
+dmrs_sig_INFvNINF_continuous_gr <- dmrs_INFvNINF_continuous_gr[dmrs_INFvNINF_continuous_gr$Stouffer < 0.05,]
+
+for(i in 1:10){
+  Cairo(file = file.path(INFvNINF_dmr_dir, paste0(i, "_", gsub("[:-]", "_", dmrs_INFvNINF_continuous_gr[i,]), ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  dmr_genome_plot(chr = as.character(seqnames(dmrs_INFvNINF_continuous_gr[i,])), 
+                  betas = betas, 
+                  annotation.gr = anno, 
+                  factor_interest = pData(gmset)$Degree, 
+                  plotgrid = F,
+                  start_dmr = start(dmrs_INFvNINF_continuous_gr[i,]), 
+                  end_dmr = end(dmrs_INFvNINF_continuous_gr[i,]))
+  dev.off()
+}
+
+#Enrichment
+##Gene
+dmrs_sig_INFvNINF_continuous_gene <- split(dmrs_sig_INFvNINF_continuous_gr, as.character(dmrs_sig_INFvNINF_continuous_gr$SYMBOL))
+dmrs_sig_INFvNINF_continuous_width <- sort(unlist(lapply(dmrs_sig_INFvNINF_continuous_gene, function(dmr) sum(width(dmr)))), decreasing = T)
+
+##Pathway
+dmrs_sig_INFvNINF_continuous_hyper_gr <- dmrs_sig_INFvNINF_continuous_gr[dmrs_sig_INFvNINF_continuous_gr$meanbetafc > 0,]
+dmrs_sig_INFvNINF_continuous_hypo_gr <- dmrs_sig_INFvNINF_continuous_gr[dmrs_sig_INFvNINF_continuous_gr$meanbetafc < 0,]
+
+dmrs_sig_INFvNINF_continuous_hyper_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_INFvNINF_continuous_hyper_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+dmrs_sig_INFvNINF_continuous_hypo_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_INFvNINF_continuous_hypo_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+```
+
+```{r DMR: CD STEN vs CD NINF}
+STENvNINF_dmr_dir <- file.path(condmr_dir, "STENvNINF")
+dir.create(STENvNINF_dmr_dir)
+
+cpg_anno_STENvNINF_continuous <- cpg.annotate(object = mvals,
+                                              datatype = "array",
+                                              arraytype = "EPIC",
+                                              what = "M",
+                                              analysis.type = "differential",
+                                              design = design_continuous,
+                                              contrasts = T,
+                                              cont.matrix = contrast_continuous,
+                                              coef = "STENvNINF")
+dmrs_STENvNINF_continuous <- dmrcate(cpg_anno_STENvNINF_continuous, lambda = 1000, C = 2, min.cpgs = 3, mc.cores = 8, pcutoff = 0.05)
+dmrs_STENvNINF_continuous_gr <- extractRanges(dmrs_STENvNINF_continuous, genome = "hg19")
+
+require(TxDb.Hsapiens.UCSC.hg19.knownGene)
+require(ChIPseeker)
+dmrs_STENvNINF_continuous_gr <- as.GRanges(annotatePeak(peak = dmrs_STENvNINF_continuous_gr, 
+                                                     TxDb = TxDb.Hsapiens.UCSC.hg19.knownGene,
+                                                     annoDb = "org.Hs.eg.db"))
+
+write.csv(as.data.frame(dmrs_STENvNINF_continuous_gr), file.path(STENvNINF_dmr_dir, "STENvNINF_dmrs.csv"))
+#dmrs_STENvNINF_continuous_gr <- makeGRangesFromDataFrame(read.csv(file.path(STENvNINF_dmr_dir, "STENvNINF_dmrs.csv")), keep.extra.columns = T)
+dmrs_sig_STENvNINF_continuous_gr <- dmrs_STENvNINF_continuous_gr[dmrs_STENvNINF_continuous_gr$Stouffer < 0.05,]
+
+for(i in 1:10){
+  Cairo(file = file.path(STENvNINF_dmr_dir, paste0(i, "_", gsub("[:-]", "_", dmrs_STENvNINF_continuous_gr[i,]), ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  dmr_genome_plot(chr = as.character(seqnames(dmrs_STENvNINF_continuous_gr[i,])), 
+                  betas = betas, 
+                  annotation.gr = anno, 
+                  factor_interest = pData(gmset)$Degree, 
+                  plotgrid = F,
+                  start_dmr = start(dmrs_STENvNINF_continuous_gr[i,]), 
+                  end_dmr = end(dmrs_STENvNINF_continuous_gr[i,]))
+  dev.off()
+}
+
+#Enrichment
+##Gene
+dmrs_sig_STENvNINF_continuous_gene <- split(dmrs_sig_STENvNINF_continuous_gr, as.character(dmrs_sig_STENvNINF_continuous_gr$SYMBOL))
+dmrs_sig_STENvNINF_continuous_width <- sort(unlist(lapply(dmrs_sig_STENvNINF_continuous_gene, function(dmr) sum(width(dmr)))), decreasing = T)
+head(dmrs_sig_STENvNINF_continuous_width, n = 10)
+
+STENvNINF_gene_plot <- gene_enrichplot(width = dmrs_sig_STENvNINF_continuous_width, genes = names(dmrs_sig_STENvNINF_continuous_width))
+
+##Pathway
+dmrs_sig_STENvNINF_continuous_hyper_gr <- dmrs_sig_STENvNINF_continuous_gr[dmrs_sig_STENvNINF_continuous_gr$meanbetafc > 0,]
+dmrs_sig_STENvNINF_continuous_hypo_gr <- dmrs_sig_STENvNINF_continuous_gr[dmrs_sig_STENvNINF_continuous_gr$meanbetafc < 0,]
+
+dmrs_sig_STENvNINF_continuous_hyper_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_STENvNINF_continuous_hyper_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+dmrs_sig_STENvNINF_continuous_hypo_enr <- chipenrich(peaks = as.data.frame(dmrs_sig_STENvNINF_continuous_hypo_gr)[,c(1:3)],
+                                                      genome = 'hg19', 
+                                                      genesets = c("kegg_pathway", "reactome"),  
+                                                      method = 'chipenrich', 
+                                                      locusdef = "nearest_tss", 
+                                                      qc_plots = FALSE, 
+                                                      out_name = NULL, 
+                                                      n_cores = 4)
+
+STENvNINF_hyperplot <- pathway_enrichplot(results = dmrs_sig_STENvNINF_continuous_hyper_enr$results, n = 10)
+STENvNINF_hypoplot <- pathway_enrichplot(results = dmrs_sig_STENvNINF_continuous_hypo_enr$results, n = 10)
+```
+
+Data for the manuscript
+```{r Manuscript data}
+manuscript_dir <- file.path("manuscript")
+figure_dir <- file.path(manuscript_dir, "figures")
+table_dir <- file.path(manuscript_dir, "tables")
+
+require(ggpubr)
+require(Cairo)
+require(xlsx)
+
+#Figure 2 DMR enrichment analyses
+figure_dmr_enrichment_dir <- file.path(figure_dir, "figure_2_DMR_enrichment")
+dir.create(figure_dmr_enrichment_dir)
+
+Cairo(file = file.path(figure_dmr_enrichment_dir, "CDvNon_CD_gene_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(CDvNon_CD_gene_plot)
+dev.off()
+Cairo(file = file.path(figure_dmr_enrichment_dir, "STENvNINF_gene_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(STENvNINF_gene_plot)
+dev.off()
+
+Cairo(file = file.path(figure_dmr_enrichment_dir, "CDvNon_CD_hyper_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(CDvNon_CD_hyperplot)
+dev.off()
+Cairo(file = file.path(figure_dmr_enrichment_dir, "STENvNINF_hyper_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(STENvNINF_hyperplot)
+dev.off()
+
+Cairo(file = file.path(figure_dmr_enrichment_dir, "CDvNon_CD_hypo_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(CDvNon_CD_hypoplot)
+dev.off()
+Cairo(file = file.path(figure_dmr_enrichment_dir, "STENvNINF_hypo_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(STENvNINF_hypoplot)
+dev.off()
+
+#Figure S2 DMP volcano plots
+figure_dmp_volcano_dir <- file.path(figure_dir, "figure_S2_DMP_volcanoplots")
+dir.create(figure_dmp_volcano_dir)
+
+Cairo(file = file.path(figure_dmp_volcano_dir, "CDvNon_CD_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = CDvNon_CD_top$Beta, 
+             pvals = CDvNon_CD_top$P.Value,
+             significance = CDvNon_CD_top$adj.P.Val<0.05,
+             identifiers = rownames(CDvNon_CD_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "CD vs non-CD",
+             top_names = 10)
+dev.off()
+
+Cairo(file = file.path(figure_dmp_volcano_dir, "INFvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = INFvNINF_top$Beta, 
+             pvals = INFvNINF_top$P.Value,
+             significance = INFvNINF_top$adj.P.Val<0.05,
+             identifiers = rownames(INFvNINF_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "INF vs NINF",
+             top_names = 10)
+dev.off()
+
+Cairo(file = file.path(figure_dmp_volcano_dir, "STENvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = STENvNINF_top$Beta, 
+             pvals = STENvNINF_top$P.Value,
+             significance = STENvNINF_top$adj.P.Val<0.05,
+             identifiers = rownames(STENvNINF_top),
+             int_effect_threshold = 0.2,
+             y_lab = "-log10(P)",
+             x_lab = "Mean effect size (Beta)",
+             title = "STEN vs NINF",
+             top_names = 10)
+dev.off()
+
+#Table s2 DMRs
+table_dmrs_dir <- file.path(table_dir, "table_s2_DMRs")
+dir.create(table_dmrs_dir)
+
+CDvNon_CD_DMRs_table <- data.frame(mcols(dmrs_CDvNon_CD_continuous_gr)[,c("X", "no.cpgs", "Stouffer", "meanbetafc", "ENSEMBL", "SYMBOL", "GENENAME")])
+INFvNINF_DMRs_table <- data.frame(mcols(dmrs_INFvNINF_continuous_gr)[,c("X", "no.cpgs", "Stouffer", "meanbetafc", "ENSEMBL", "SYMBOL", "GENENAME")])
+STENvNINF_DMRs_table <- data.frame(mcols(dmrs_STENvNINF_continuous_gr)[,c("X", "no.cpgs", "Stouffer", "meanbetafc", "ENSEMBL", "SYMBOL", "GENENAME")])
+
+colnames(CDvNon_CD_DMRs_table) <- colnames(INFvNINF_DMRs_table) <- colnames(STENvNINF_DMRs_table) <- c("Coordinates", "nCpGs", "Stouffer", "mean_Beta", "Ensembl", "Gene", "Gene_name")
+
+write.xlsx(CDvNon_CD_DMRs_table, file = file.path(table_dmrs_dir, "DMRs.xlsx"), sheetName = "CDvNon_CD", row.names = FALSE)
+write.xlsx(INFvNINF_DMRs_table, file = file.path(table_dmrs_dir, "DMRs.xlsx"), sheetName = "INFvNINF", row.names = FALSE, append = T)
+write.xlsx(STENvNINF_DMRs_table, file = file.path(table_dmrs_dir, "DMRs.xlsx"), sheetName = "STENvNINF", row.names = FALSE, append = T)
+
+#Table s3 DMRs
+table_dmrs_enrichment_dir <- file.path(table_dir, "table_s3_DMR_enrichment")
+
+CDvNon_CD_pathways_hyper <- dmrs_sig_CDvNon_CD_continuous_hyper_enr$results[,c("Geneset.Type", "Geneset.ID", "Description", "P.value", "FDR", "N.Geneset.Genes", "N.Geneset.Peak.Genes", "Geneset.Avg.Gene.Length", "Geneset.Peak.Genes")]
+CDvNon_CD_pathways_hypo <- dmrs_sig_CDvNon_CD_continuous_hypo_enr$results[,c("Geneset.Type", "Geneset.ID", "Description", "P.value", "FDR", "N.Geneset.Genes", "N.Geneset.Peak.Genes", "Geneset.Avg.Gene.Length", "Geneset.Peak.Genes")]
+STENvNINF_pathways_hyper <- dmrs_sig_STENvNINF_continuous_hyper_enr$results[,c("Geneset.Type", "Geneset.ID", "Description", "P.value", "FDR", "N.Geneset.Genes", "N.Geneset.Peak.Genes", "Geneset.Avg.Gene.Length", "Geneset.Peak.Genes")]
+STENvNINF_pathways_hypo <- dmrs_sig_STENvNINF_continuous_hypo_enr$results[,c("Geneset.Type", "Geneset.ID", "Description", "P.value", "FDR", "N.Geneset.Genes", "N.Geneset.Peak.Genes", "Geneset.Avg.Gene.Length", "Geneset.Peak.Genes")]
+
+colnames(CDvNon_CD_pathways_hyper) <- colnames(CDvNon_CD_pathways_hypo) <- colnames(STENvNINF_pathways_hyper) <- colnames(STENvNINF_pathways_hypo) <- c("Database", "Geneset_ID", "Description", "pvalue", "padj", "N_background", "N_observed", "Average_gene_length", "EntrezID_set")
+
+write.xlsx(CDvNon_CD_pathways_hyper, file = file.path(table_dmrs_enrichment_dir, "DMR_pathway_enrichment.xlsx"), sheetName = "CDvNon_CD Hyper", row.names = FALSE)
+write.xlsx(CDvNon_CD_pathways_hypo, file = file.path(table_dmrs_enrichment_dir, "DMR_pathway_enrichment.xlsx"), sheetName = "CDvNon_CD Hypo", row.names = FALSE, append = T)
+write.xlsx(STENvNINF_pathways_hyper, file = file.path(table_dmrs_enrichment_dir, "DMR_pathway_enrichment.xlsx"), sheetName = "STENvNINF Hyper", row.names = FALSE)
+write.xlsx(STENvNINF_pathways_hypo, file = file.path(table_dmrs_enrichment_dir, "DMR_pathway_enrichment.xlsx"), sheetName = "STENvNINF Hypo", row.names = FALSE, append = T)
+```
+
+```{r Final}
+sessionInfo()
+today <- gsub("^([0-9]{4})-([0-9]{2})-([0-9]{2}).+$", "\\1\\2\\3", Sys.time())
+
+rdata_dir <- file.path(output_dir, "rdata")
+dir.create(rdata_dir)
+save.image(file = file.path(output_dir, "rdata", paste0(today, ".RData")))
+```

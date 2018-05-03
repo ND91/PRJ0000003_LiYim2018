@@ -1,0 +1,479 @@
+---
+title: "DE analyses PROJ0000003_DEEXPRNA"
+author: "Andrew Li Yim"
+date: "November 9, 2016"
+output: pdf_document
+---
+
+In this workbook we will perform differential expression analysis on human ileal fibroblasts that were extracted from resection material and cultured. We are interested in finding the genes that are differentially expressed among the different groups:
+- CD vs Non-CD
+- INF vs NINF
+- STEN vs NINF
+
+```{r setup}
+data_dir <- file.path("data/02_gene_expression")
+output_dir <- file.path("output/02_gene_expression")
+
+top_dir <- file.path(output_dir, "top_genes")
+dir.create(top_dir)
+
+#Colorblind color palette
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+Import the DESeqDataset
+```{r Import dds}
+dds_intraCD <- readRDS(file.path(output_dir, "preprocessing", "dds_intraCD.Rds"))
+dds_interCD <- readRDS(file.path(output_dir, "preprocessing", "dds_interCD.Rds"))
+```
+
+Perform DESeq analyses
+```{r DESeq}
+dds_intraCD <- DESeq(dds_intraCD)
+dds_interCD <- DESeq(dds_interCD)
+
+rld <- assay(rlog(dds_intraCD, blind = F))
+```
+
+We now perform pairwise Wald tests:
+```{r CD vs Non_CD}
+require(NDlib)
+
+results_CDvNon_CD <- results(dds_interCD, contrast=c("Phenotype", "CD", "Non_CD"))
+results_CDvNon_CD <- results_CDvNon_CD[order(results_CDvNon_CD$pvalue),]
+results_CDvNon_CD$hgnc_symbol <- rowData(dds_interCD)[match(rownames(results_CDvNon_CD), rowData(dds_interCD)$ensembl_gene_id), "hgnc_symbol"]
+results_CDvNon_CD$entrez_id <- rowData(dds_interCD)[match(rownames(results_CDvNon_CD), rowData(dds_interCD)$ensembl_gene_id), "entrezgene"]
+if(length(which(is.na(results_CDvNon_CD$padj))) != 0){
+  results_CDvNon_CD <- results_CDvNon_CD[-which(is.na(results_CDvNon_CD$padj)),]  
+}
+
+CDvNon_CD_dir <- file.path(top_dir, "CDvNon_CD")
+dir.create(CDvNon_CD_dir)
+
+write.csv(results_CDvNon_CD, file = file.path(CDvNon_CD_dir, "DEGs_CDvNon_CD.csv"))
+
+#GSEA
+rnk_CDvNon_CD <- data.frame(results_CDvNon_CD$entrez_id, results_CDvNon_CD$stat)
+rnk_CDvNon_CD <- rnk_CDvNon_CD[!is.na(rnk_CDvNon_CD$results_CDvNon_CD.entrez_id),]
+write.table(rnk_CDvNon_CD, file = file.path(CDvNon_CD_dir, "CDvNon_CD.rnk"), quote = F, row.names = F, col.names = F)
+
+#Plotting
+require(Cairo)
+for(i in 1:10){
+  #Cairo(file = file.path(CDvNon_CD_dir, paste0(i, "_", rownames(results_CDvNon_CD)[i], "_", results_CDvNon_CD$hgnc_symbol[i], ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  print(transcript_strip_plot(id = rownames(results_CDvNon_CD)[i], 
+                              type = "SE",
+                              counts = rld, 
+                              y_lab = "log2(counts)", 
+                              title = results_CDvNon_CD$hgnc_symbol[i],
+                              factor_interest = colData(dds_interCD)$Phenotype))
+  #dev.off()
+}
+
+Cairo(file = file.path(CDvNon_CD_dir, "CDvNon_CD_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_CDvNon_CD$log2FoldChange, 
+             title = "CD vs Non_CD",
+             pvals = results_CDvNon_CD$pvalue, 
+             significance = results_CDvNon_CD$padj < 0.05, 
+             identifiers = results_CDvNon_CD$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+```
+
+```{r INF vs NINF}
+require(NDlib)
+
+results_INFvNINF <- results(dds_intraCD, contrast=c("Degree", "INF", "NINF"))
+results_INFvNINF <- results_INFvNINF[order(results_INFvNINF$pvalue),]
+results_INFvNINF$hgnc_symbol <- rowData(dds_intraCD)[match(rownames(results_INFvNINF), rowData(dds_intraCD)$ensembl_gene_id), "hgnc_symbol"]
+results_INFvNINF$entrez_id <- rowData(dds_intraCD)[match(rownames(results_INFvNINF), rowData(dds_intraCD)$ensembl_gene_id), "entrezgene"]
+if(length(which(is.na(results_INFvNINF$padj))) != 0){
+  results_INFvNINF <- results_INFvNINF[-which(is.na(results_INFvNINF$padj)),]  
+}
+
+INFvNINF_dir <- file.path(top_dir, "INFvNINF")
+dir.create(INFvNINF_dir)
+
+write.csv(results_INFvNINF, file = file.path(INFvNINF_dir, "DEGs_INFvNINF.csv"))
+
+#GSEA
+rnk_INFvNINF <- data.frame(results_INFvNINF$entrez_id, results_INFvNINF$stat)
+rnk_INFvNINF <- rnk_INFvNINF[!is.na(rnk_INFvNINF$results_INFvNINF.entrez_id),]
+write.table(rnk_INFvNINF, file = file.path(INFvNINF_dir, "INFvNINF.rnk"), quote = F, row.names = F, col.names = F)
+
+#Plotting
+require(Cairo)
+for(i in 1:10){
+  Cairo(file = file.path(INFvNINF_dir, paste0(i, "_", rownames(results_INFvNINF)[i], "_", results_INFvNINF$hgnc_symbol[i], ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  print(transcript_strip_plot(id = rownames(results_INFvNINF)[i], 
+                              type = "SE",
+                              counts = rld, 
+                              y_lab = "log2(counts)", 
+                              title = results_INFvNINF$hgnc_symbol[i],
+                              factor_interest = colData(dds_interCD)$Degree))
+  dev.off()
+}
+
+Cairo(file = file.path(INFvNINF_dir, "INFvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_INFvNINF$log2FoldChange, 
+             title = "INF vs NINF",
+             pvals = results_INFvNINF$pvalue, 
+             significance = results_INFvNINF$padj < 0.05, 
+             identifiers = results_INFvNINF$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+```
+
+```{r STEN vs NINF}
+require(NDlib)
+
+results_STENvNINF <- results(dds_intraCD, contrast=c("Degree", "STEN", "NINF"))
+results_STENvNINF <- results_STENvNINF[order(results_STENvNINF$pvalue),]
+results_STENvNINF$hgnc_symbol <- rowData(dds_intraCD)[match(rownames(results_STENvNINF), rowData(dds_intraCD)$ensembl_gene_id), "hgnc_symbol"]
+results_STENvNINF$entrez_id <- rowData(dds_intraCD)[match(rownames(results_STENvNINF), rowData(dds_intraCD)$ensembl_gene_id), "entrezgene"]
+if(length(which(is.na(results_STENvNINF$padj))) != 0){
+  results_STENvNINF <- results_STENvNINF[-which(is.na(results_STENvNINF$padj)),]  
+}
+
+STENvNINF_dir <- file.path(top_dir, "STENvNINF")
+dir.create(STENvNINF_dir)
+
+write.csv(results_STENvNINF, file = file.path(STENvNINF_dir, "DEGs_STENvNINF.csv"))
+
+#GSEA
+rnk_STENvNINF <- data.frame(results_STENvNINF$entrez_id, results_STENvNINF$stat)
+rnk_STENvNINF <- rnk_STENvNINF[!is.na(rnk_STENvNINF$results_STENvNINF.entrez_id),]
+write.table(rnk_STENvNINF, file = file.path(STENvNINF_dir, "STENvNINF.rnk"), quote = F, row.names = F, col.names = F)
+
+#Plotting
+require(Cairo)
+for(i in 1:10){
+  Cairo(file = file.path(STENvNINF_dir, paste0(i, "_", rownames(results_STENvNINF)[i], "_", results_STENvNINF$hgnc_symbol[i], ".pdf")), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+  print(transcript_strip_plot(id = rownames(results_STENvNINF)[i], 
+                              type = "SE",
+                              counts = rld, 
+                              y_lab = "log2(counts)", 
+                              title = results_STENvNINF$hgnc_symbol[i],
+                              factor_interest = colData(dds_interCD)$Degree))
+  dev.off()
+}
+
+Cairo(file = file.path(STENvNINF_dir, "STENvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_STENvNINF$log2FoldChange, 
+             title = "STEN vs NINF",
+             pvals = results_STENvNINF$pvalue, 
+             significance = results_STENvNINF$padj < 0.05, 
+             identifiers = results_STENvNINF$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+```
+
+```{r Combined volcano plot}
+CDvNon_CD_sub <- cbind(data.frame(results_CDvNon_CD[,c("log2FoldChange", "pvalue", "padj", "hgnc_symbol")]), Comparison = "CDvNon_CD")
+INFvNINF_sub <- cbind(data.frame(results_INFvNINF[,c("log2FoldChange", "pvalue", "padj", "hgnc_symbol")]), Comparison = "INFvNINF")
+STENvNINF_sub <- cbind(data.frame(results_STENvNINF[,c("log2FoldChange", "pvalue", "padj", "hgnc_symbol")]), Comparison = "STENvNINF")
+
+results_sub <- rbind(CDvNon_CD_sub, INFvNINF_sub, STENvNINF_sub)
+colnames(results_sub) <- c("logfc", "pvalue", "padj", "hgnc_symbol", "comparison")
+results_sub$significant <- ifelse(results_sub$padj < 0.05, 1, 0.1)
+results_sub$logpval <- -log10(results_sub$pvalue)
+
+ggplot(results_sub, aes(x = logfc, y = logpval, col = comparison, alpha = significant)) +
+  geom_point() +
+  theme_bw()
+
+```
+This does not look as good as I envisioned it.
+
+```{r Enrichment analyses}
+pathway_enrichplot <- function(results, n = 10){
+  pathwayid <- gsub("Homo sapiens: ", "", rownames(results))
+  pathwayid <- gsub("^(.+?) (.+)$", "(\\1) \\2", pathwayid)
+  pathwayid_wrapped <- sapply(X = pathwayid, FUN = function(x){
+    paste(strwrap(x,width=20), collapse="\n")
+  }, simplify = T)
+  results$pathwayid <- pathwayid_wrapped
+  
+  data_df <- head(results, n = n)
+
+  plot_df <- data.frame(pathway = data_df$pathwayid,
+                        logpval = -log10(data_df$PValue),
+                        Significant = factor(ifelse(data_df$FDR < 0.05, T, F), levels = c(T, F)))
+
+  ggplot(plot_df, aes(x = pathway, y = logpval)) +
+    geom_point(aes(col = Significant)) +
+    scale_x_discrete(limits=rev(plot_df$pathway)) +
+    theme_bw() +
+    ylab("-log10(p)") +
+    theme(axis.title.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title.x = element_text(size = 14, face = "bold"),
+          axis.text.x = element_text(size = 12), 
+          legend.title = element_text(size = 14, face = "bold"),
+          legend.text = element_text(size = 12)) +
+    scale_colour_hue(drop = FALSE) +
+    coord_flip() +
+    ylim(0, NA)
+}
+
+
+require(limma)
+msigdb_dir <- file.path("~/hdd1/common_data/MSigDb")
+msigdb_c2 <- scan(file.path(msigdb_dir, "c2.all.v6.1.entrez.gmt"), what="", sep="\n")
+msigdb_c2 <- strsplit(msigdb_c2, "[[:space:]]+")
+names(msigdb_c2) <- sapply(msigdb_c2, `[[`, 1)
+msigdb_c2 <- lapply(msigdb_c2, `[`, -c(1:2))
+saveRDS(msigdb_c2, file.path(msigdb_dir, "c2.all.v6.1.entrez.Rds"))
+
+#I only take the KEGG and reactome pathways as the others often include disease specific gene sets, which are at the moment less interesting
+msigdb_c2_kegg_reactome <- msigdb_c2[grep("(REACTOME|KEGG)", names(msigdb_c2))]
+
+design_matrix_inter <- model.matrix(~0 + Phenotype + Passage + Gender + Age + Medication, data = colData(dds_interCD))
+#design_matrix_inter <- model.matrix(~Phenotype, data = colData(dds_interCD))
+design_matrix_intra <- model.matrix(~0 + Degree + Passage + Gender + Age + Medication, data = colData(dds_intraCD))
+#design_matrix_intra <- model.matrix(~0 + Degree, data = colData(dds_intraCD))
+
+contrast_matrix_interCD <- makeContrasts(
+  CDvNon_CD = PhenotypeCD-PhenotypeNon_CD,
+  levels = design_matrix_inter
+)
+
+contrast_matrix_intraCD <- makeContrasts(
+  INFvNINF = DegreeINF-DegreeNINF,
+  STENvNINF = DegreeSTEN-DegreeNINF,
+  levels = design_matrix_intra
+)
+
+rld_entrez <- rld
+rownames(rld_entrez) <- rowData(dds_intraCD)$entrezgene
+rld_entrez <- rld_entrez[!is.na(rownames(rld_entrez)),]
+
+#Databases
+require(reactome.db)
+require(gage)
+
+kegg_set <- kegg.gsets("hsa")$kg.sets
+reactome_set <- as.list(reactomePATHID2EXTID)
+reactome_set <- reactome_set[grep("HSA", names(reactome_set))]
+reactome_names <- as.list(reactomePATHID2NAME)
+
+names(reactome_set) <- paste0(names(reactome_set), " ", unlist(reactome_names)[names(reactome_set)])
+
+geneset <- c(reactome_set, kegg_set)
+
+CDvNon_CD_camera_c2 <- camera(rld_entrez, index = geneset, design = design_matrix_inter, contrast = contrast_matrix_interCD[,"CDvNon_CD"])
+INFvNINF_camera_c2 <- camera(rld_entrez, index = geneset, design = design_matrix_intra, contrast = contrast_matrix_intraCD[,"INFvNINF"])
+STENvNINF_camera_c2 <- camera(rld_entrez, index = geneset, design = design_matrix_intra, contrast = contrast_matrix_intraCD[,"STENvNINF"])
+
+CDvNon_CD_camera_up <- CDvNon_CD_camera_c2[CDvNon_CD_camera_c2$Direction == "Up",]
+CDvNon_CD_camera_down <- CDvNon_CD_camera_c2[CDvNon_CD_camera_c2$Direction == "Down",]
+CDvNon_CD_up_plot <- pathway_enrichplot(CDvNon_CD_camera_up)
+CDvNon_CD_down_plot <- pathway_enrichplot(CDvNon_CD_camera_down)
+
+INFvNINF_camera_up <- INFvNINF_camera_c2[INFvNINF_camera_c2$Direction == "Up",]
+INFvNINF_camera_down <- INFvNINF_camera_c2[INFvNINF_camera_c2$Direction == "Down",]
+INFvNINF_up_plot <- pathway_enrichplot(INFvNINF_camera_up)
+INFvNINF_down_plot <- pathway_enrichplot(INFvNINF_camera_down)
+
+STENvNINF_camera_up <- STENvNINF_camera_c2[STENvNINF_camera_c2$Direction == "Up",]
+STENvNINF_camera_down <- STENvNINF_camera_c2[STENvNINF_camera_c2$Direction == "Down",]
+STENvNINF_up_plot <- pathway_enrichplot(STENvNINF_camera_up)
+STENvNINF_down_plot <- pathway_enrichplot(STENvNINF_camera_down)
+```
+
+```{r STENvNINF: ECM pathways}
+STENvNINF_camera_c2[grep("ECM", rownames(STENvNINF_camera_c2)),]
+
+Cairo(file = file.path(STENvNINF_dir, "ECM_RECEPTOR_INTERACTION_barcode.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% geneset$"R-HSA-3000178 Homo sapiens: ECM proteoglycans"),
+            xlab = "Wald statistic",
+            main = "ECM receptor interaction")
+dev.off()
+
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% msigdb_c2$REACTOME_MUSCLE_CONTRACTION),
+            xlab = "stat")
+```
+
+Data for the manuscript
+```{r Manuscript data}
+manuscript_dir <- file.path("manuscript")
+figure_dir <- file.path(manuscript_dir, "figures")
+table_dir <- file.path(manuscript_dir, "tables")
+
+#Figure 3 Enrichment DEGs
+figure_deg_enrichment_dir <- file.path(figure_dir, "figure_3_DEG_enrichment")
+dir.create(figure_deg_enrichment_dir)
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "CDvNon_CD_up_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(CDvNon_CD_up_plot)
+dev.off()
+Cairo(file = file.path(figure_deg_enrichment_dir, "CDvNon_CD_down_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(CDvNon_CD_down_plot)
+dev.off()
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "STENvNINF_up_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(STENvNINF_up_plot)
+dev.off()
+Cairo(file = file.path(figure_deg_enrichment_dir, "STENvNINF_down_enrichment.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(STENvNINF_down_plot)
+dev.off()
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "ECM_proteoglycans.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% geneset$"R-HSA-3000178 Homo sapiens: ECM proteoglycans"),
+            xlab = "Wald statistic",
+            main = "ECM proteoglycans")
+dev.off()
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "Extracellular_matrix_organization.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% geneset$"R-HSA-1474244 Homo sapiens: Extracellular matrix organization"),
+            xlab = "Wald statistic",
+            main = "ECM organization")
+dev.off()
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "Elastic_fibre_formation.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% geneset$"R-HSA-1566948 Homo sapiens: Elastic fibre formation"),
+            xlab = "Wald statistic",
+            main = "Elastic fiber formation")
+dev.off()
+
+Cairo(file = file.path(figure_deg_enrichment_dir, "Molecules_associated_with_elastic_fibres"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+barcodeplot(statistics = results_STENvNINF$stat, 
+            index = which(results_STENvNINF$entrez_id %in% geneset$"R-HSA-2129379 Homo sapiens: Molecules associated with elastic fibres"),
+            xlab = "Wald statistic",
+            main = "Molecular associated with elastic fibers")
+dev.off()
+
+#Figure S3 Volcano plot
+figure_deg_volcano_dir <- file.path(figure_dir, "figure_S3_DEG_volcanoplots")
+dir.create(figure_deg_volcano_dir)
+
+Cairo(file = file.path(figure_deg_volcano_dir, "CDvNon_CD_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_CDvNon_CD$log2FoldChange, 
+             title = "CD vs non-CD",
+             pvals = results_CDvNon_CD$pvalue, 
+             significance = results_CDvNon_CD$padj < 0.05, 
+             identifiers = results_CDvNon_CD$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+
+Cairo(file = file.path(figure_deg_volcano_dir, "INFvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_INFvNINF$log2FoldChange, 
+             title = "INF vs NINF",
+             pvals = results_INFvNINF$pvalue, 
+             significance = results_INFvNINF$padj < 0.05, 
+             identifiers = results_INFvNINF$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+
+Cairo(file = file.path(figure_deg_volcano_dir, "STENvNINF_volcano.png"), type = "png", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+volcano_plot(effect_sizes = results_STENvNINF$log2FoldChange, 
+             title = "STEN vs NINF",
+             pvals = results_STENvNINF$pvalue, 
+             significance = results_STENvNINF$padj < 0.05, 
+             identifiers = results_STENvNINF$hgnc_symbol, 
+             int_effect_threshold = 1, 
+             top_names = 10)
+dev.off()
+
+#Table S4 DEGs
+table_degs_dir <- file.path(table_dir, "table_s4_DEGs")
+dir.create(table_degs_dir)
+
+CDvNon_CD_DEGs_table <- data.frame(results_CDvNon_CD[, c("log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "hgnc_symbol", "entrez_id")], rownames(results_CDvNon_CD))
+INFvNINF_DEGs_table <- data.frame(results_INFvNINF[, c("log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "hgnc_symbol", "entrez_id")], rownames(results_INFvNINF))
+STENvNINF_DEGs_table <- data.frame(results_STENvNINF[, c("log2FoldChange", "lfcSE", "stat", "pvalue", "padj", "hgnc_symbol", "entrez_id")], rownames(results_STENvNINF))
+
+colnames(STENvNINF_DEGs_table) <- colnames(INFvNINF_DEGs_table) <- colnames(CDvNon_CD_DEGs_table) <- c("Log2FC", "Log2FC-SE", "Wald", "pvalue", "padj", "Gene", "Entrez", "Ensembl")
+
+deg_table <- list(CDvNon_CD = CDvNon_CD_DEGs_table,
+                  INFvNINF = INFvNINF_DEGs_table,
+                  STENvNINF = STENvNINF_DEGs_table)
+
+require(openxlsx)
+wb <- createWorkbook()
+Map(function(data, name){
+ 
+    addWorksheet(wb, name)
+    writeData(wb, name, data)
+ 
+}, deg_table, names(deg_table))
+
+saveWorkbook(wb, file = file.path(table_degs_dir, "DEGs.xlsx"), overwrite = TRUE)
+
+# Table S5 DEG enrichment
+table_deg_enrichment_dir <- file.path(table_dir, "table_s5_DEG_enrichment")
+dir.create(table_deg_enrichment_dir)
+
+CDvNon_CD_ID <- gsub("(.+?) .+", "\\1", rownames(CDvNon_CD_camera_c2))
+CDvNon_CD_DB <- rep("Reactome", nrow(CDvNon_CD_camera_c2))
+CDvNon_CD_DB[grep("^hsa", CDvNon_CD_ID)] <- "KEGG"
+CDvNon_CD_Desc <- gsub("^.+: (.+)$", "\\1", rownames(CDvNon_CD_camera_c2))
+
+table_c2_CDvNon_CD <- data.frame(Database = CDvNon_CD_DB,
+                                 Geneset_ID = CDvNon_CD_ID, 
+                                 Description = CDvNon_CD_Desc, 
+                                 pvalue = CDvNon_CD_camera_c2$PValue,
+                                 padj = CDvNon_CD_camera_c2$FDR,
+                                 Direction = CDvNon_CD_camera_c2$Direction,
+                                 N_background = CDvNon_CD_camera_c2$NGenes)
+
+INFvNINF_ID <- gsub("(.+?) .+", "\\1", rownames(INFvNINF_camera_c2))
+INFvNINF_DB <- rep("Reactome", nrow(INFvNINF_camera_c2))
+INFvNINF_DB[grep("^hsa", INFvNINF_ID)] <- "KEGG"
+INFvNINF_Desc <- gsub("^.+: (.+)$", "\\1", rownames(INFvNINF_camera_c2))
+
+table_c2_INFvNINF <- data.frame(Database = INFvNINF_DB,
+                                 Geneset_ID = INFvNINF_ID, 
+                                 Description = INFvNINF_Desc, 
+                                 pvalue = INFvNINF_camera_c2$PValue,
+                                 padj = INFvNINF_camera_c2$FDR,
+                                 Direction = INFvNINF_camera_c2$Direction,
+                                 N_background = INFvNINF_camera_c2$NGenes)
+
+STENvNINF_camera_c2
+STENvNINF_ID <- gsub("(.+?) .+", "\\1", rownames(STENvNINF_camera_c2))
+STENvNINF_DB <- rep("Reactome", nrow(STENvNINF_camera_c2))
+STENvNINF_DB[grep("^hsa", STENvNINF_ID)] <- "KEGG Pathways"
+STENvNINF_Desc <- gsub("^.+: (.+)$", "\\1", rownames(STENvNINF_camera_c2))
+
+table_c2_STENvNINF <- data.frame(Database = STENvNINF_DB,
+                                 Geneset_ID = STENvNINF_ID, 
+                                 Description = STENvNINF_Desc, 
+                                 pvalue = STENvNINF_camera_c2$PValue,
+                                 padj = STENvNINF_camera_c2$FDR,
+                                 Direction = STENvNINF_camera_c2$Direction,
+                                 N_background = STENvNINF_camera_c2$NGenes)
+
+tables_DEG_enrichment <- list(CDvNon_CD = table_c2_CDvNon_CD,
+                              STENvNINF = table_c2_STENvNINF)
+
+require(openxlsx)
+wb <- createWorkbook()
+Map(function(data, name){
+ 
+    addWorksheet(wb, name)
+    writeData(wb, name, data)
+ 
+}, tables_DEG_enrichment, names(tables_DEG_enrichment))
+
+saveWorkbook(wb, file = file.path(table_deg_enrichment_dir, "DEG_pathway_enrichment.xlsx"), overwrite = TRUE)
+```
+
+```{r Final}
+sessionInfo()
+today <- gsub("^([0-9]{4})-([0-9]{2})-([0-9]{2}).+$", "\\1\\2\\3", Sys.time())
+
+rdata_dir <- file.path(output_dir, "rdata")
+dir.create(rdata_dir)
+save.image(file = file.path(output_dir, "rdata", paste0(today, ".RData")))
+```

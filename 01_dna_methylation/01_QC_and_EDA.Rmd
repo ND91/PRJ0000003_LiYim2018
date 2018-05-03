@@ -1,0 +1,487 @@
+---
+title: "01_QC_and_EDA"
+author: "Andrew Li Yim"
+date: "April 20, 2016"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+In this document, we will perform the initial quality control of the methylation data obtained from the Illumina EPIC BeadChip array obtained from fibroblasts extracted from the ileum of CD and non-CD patients. The expected output of this document will yield an phenosheet and an experimental sheet in which samples that do not pass QC have been removed. This resulting samples data will be stored in a .csv file, whereas the total R object will be stored in a .Rds file as well.
+
+```{r setup, echo = F}
+set.seed(1)
+
+#Colorblind palette
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+#Project data
+data_dir <- file.path("data", "01_dna_methylation")
+output_dir <- file.path("output", "01_dna_methylation")
+
+#Common data
+idat_dir <- file.path(data_dir, "idat")
+samples_dir <- file.path(data_dir, "samples")
+common_dir <- file.path("~/hdd1/common_data")
+
+require(minfi)
+require(IlluminaHumanMethylationEPICmanifest)
+targets <- read.metharray.sheet(base = samples_dir, pattern = "samples_PROJ0000003_DMEXPMETH_V4.csv")
+targets$Basename <- file.path(idat_dir, targets$Slide, paste0(targets$Slide, "_", targets$Array))
+```
+
+#Quality control
+The first step is to perform quality control, whereby we check whether the sample data matches the experimental data
+```{r Quality control}
+qc_dir <- file.path(output_dir, "qc")
+dir.create(qc_dir)
+
+require(MethylAid)
+require(shinyMethyl)
+
+#MethylAid
+methylaid_summary <- summarize(targets)
+visualize(methylaid_summary)
+
+#minfi built-in
+rgset <- read.metharray.exp(targets = targets)
+mset <- preprocessRaw(rgSet = rgset)
+mset_qc <- getQC(object = mset)
+plotQC(qc = mset_qc)
+densityPlot(dat = mset, sampGroups = pData(rgset)$Degree)
+
+#ShinyMethyl
+require(IlluminaHumanMethylationEPICanno.ilm10b2.hg19)
+shiny_sum <- shinySummarize(rgset)
+#runShinyMethyl(shiny_sum)
+```
+There are two aspects that catch my attention:
+1) Some samples are missing genders.
+2) J47 clusters separately from the rest according to the PCA.
+
+```{r Normalization}
+gmset <- preprocessFunnorm(rgSet = rgset)
+```
+
+##Gender estimation
+```{r Gender estimation}
+predictedSex <- getSex(gmset, cutoff = -2)
+estimated_gender <- data.frame(ID = pData(gmset)$Code, Cohort = pData(gmset)$Degree, pheno = pData(gmset)$Gender, predicted = predictedSex$predictedSex)
+
+write.csv(estimated_gender, file.path(qc_dir, "estimated_gender.csv"))
+
+require(Cairo)
+Cairo(file = file.path(qc_dir, "gender_distribution.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+plotSex(predictedSex, id = pData(gmset)$Code)
+dev.off()
+```
+I managed to find the genders for the anonymous samples obtained from NHC1. However, there appears to be a discrepancy between the provided gender and the estimated gender for J51. ND and JdB could not elaborate on this discrepancy. As the plotSex() and getSex() functions perform k-means regression on the median of the CpGs associated to chromosome X and chromosome Y per patient, J51 cannot be a male Possible explanations would be a sample switch, non-hybridization of chromosome Y (though this would not explain the relative high intensity of chromosome X). The next chunk seeks to investigate whether all samples from J51 display this oddity. 
+```{r J51}
+require(ggplot2)
+require(RColorBrewer)
+
+#With sex chromosomes, later on during the EDA I will generate another correlation matrix without the sex chromosomes
+J51 <- gmset[, pData(gmset)$Code == "J51"]
+J51_Mval <- getM(J51)
+
+J51_Mval_cor <- cor(J51_Mval[, order(pData(J51)$Code)])
+colnames(J51_Mval_cor) <- rownames(J51_Mval_cor) <- with(pData(J51), paste0(Code, "_", Degree, "_", Passage, "_", predictedSex))
+
+require(pheatmap)
+Cairo(file = file.path(qc_dir, "J51_correlation.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+pheatmap(J51_Mval_cor, display_numbers = T)
+dev.off()
+```
+Based on the correlations among the three J51 samples, it appears that female sample is the odd one out compared to others. However, this could also be caused by the degree of CD, or perhaps both. I will therefore remove J51 from the downstream analyses.
+```{r J51 removal}
+gmset <- gmset[, -which(pData(gmset)$Code == "J51" & pData(gmset)$Degree == "INF")]
+```
+As we work with a mixed gender cohort, it would be best to remove the CpGs on the sex chromosome as well
+```{r}
+gmset <- gmset[-which(getAnnotation(gmset)$chr %in% c("chrX", "chrY")), ]
+```
+
+##Age estimation
+The anonymous patient (NHC1) from the non-CD group has limited to no associated metadata. We therefore estimated the age using Horvath's clock.
+```{r Age estimation, echo = F}
+betas <- getBeta(gmset)
+
+#Age estimation
+rev_transformation <- function(x, adult.age=20){
+  ifelse(x<0, (1+adult.age)*exp(x)-1, (1+adult.age)*x+adult.age)
+}
+
+#Horvath's clock data
+clock_data <- read.csv(file.path(common_dir, "horvath_clock/AdditionalFile3.csv"))
+
+clock.culled <- betas[rownames(betas) %in% as.character(clock_data$CpGmarker)[-1],]
+
+datClock.culled <- clock_data[as.character(clock_data$CpGmarker)[-1] %in% rownames(betas),]
+
+predictedAge <- as.numeric(rev_transformation(datClock.culled$CoefficientTraining[1] + t(clock.culled) %*% as.numeric(datClock.culled$CoefficientTraining[-1])))
+
+estimated_age <- data.frame(ID = pData(gmset)$Code, 
+                            Cohort = pData(gmset)$Degree, 
+                            Passage = pData(gmset)$Passage, 
+                            Age = pData(gmset)$Age, 
+                            predicted = predictedAge)
+write.csv(estimated_age, file.path(qc_dir, "estimated_age.csv"))
+
+#Add the estimated age to the phenodata
+pData(gmset)$predictedAge <- predictedAge
+```
+The methylation age was found to be associated with the passaging of cells. To correct for age downstream in the analyses, I will use the estimated age of the lowest passage as the true age for NHC1.
+```{r Age correction}
+#Change the age of NHC1 to the estimated age at P1, namely 57
+NHC1_samples <- which(pData(gmset)$Code == "NHC1")
+pData(gmset)[NHC1_samples, "Age"] <- round(pData(gmset)[which(pData(gmset)$Code == "NHC1" & pData(gmset)$Passage == "P1"), "predictedAge"])
+
+#Remove age-related probes just in case
+gmset <- gmset[-which(rownames(gmset) %in% rownames(clock.culled)),]
+```
+
+## SNP removal
+Some CpG probes associate to known SNPs. In this particular case, we would want to remove probes whose cytosine associates to a SNP (MAF > 0.01), or whose single base extension (SBE) associates to a SNP.
+```{r SNP removal}
+snps <- getSnpInfo(gmset)
+gmset <- gmset[-which(snps$SBE_maf > 0.01 | snps$CpG_maf > 0.01),]
+```
+
+## Promiscuous probe removal
+Some CpG probes associate to promiscuous probes. 
+```{r Promiscuous probe removal}
+prom_probes <- read.csv(file.path(common_dir, "HumanMethylationEPIC", "Non-specific-probes-illuminaEPIC.csv"), stringsAsFactors = F, header = F)
+
+gmset <- gmset[!rownames(gmset) %in% prom_probes[,1],]
+```
+
+#EDA
+The second step is to perform exploratory data analyses to see whether any of the samples are not behaving like the rest at a global scale.
+```{r setup}
+eda_dir <- file.path(output_dir, "eda")
+dir.create(eda_dir)
+```
+
+```{r Summary}
+mvals <- getM(gmset)
+summary(mvals)
+which(mvals == -Inf, arr.ind = T)
+```
+Functional normalization has the tendency of introducing -Inf M-values. I will need to remove them if I want to do any meaningful analyses.
+```{r CpG -Inf removal}
+inf_cpgs <- which(mvals == -Inf, arr.ind = T)[,1]
+
+if(length(inf_cpgs) != 0) gmset <- gmset[-inf_cpgs,]
+```
+
+```{r Sample-sample correlation, echo = F}
+require(Cairo)
+require(rafalib)
+
+mvals <- getM(gmset)
+mvals_cor <- cor(mvals)
+rownames(mvals_cor) <- colnames(mvals_cor) <- with(pData(gmset), paste0(Code, "_", Degree, "_", Passage, "_", Gender))
+
+Cairo(file = file.path(eda_dir, "Correlation_matrix.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+pheatmap(mvals_cor)
+dev.off()
+```
+
+```{r PCA}
+mvals_dm <- mvals-rowMeans(mvals)
+mvals_svd <- svd(t(mvals_dm))
+
+#Variance explained per PC
+var_per_PC <- mvals_svd$d/sum(mvals_svd$d)*100
+
+require(reshape2)
+var_per_PC_melt <- melt(var_per_PC)
+var_per_PC_melt <- cbind(var_per_PC_melt, rep(c(1:length(mvals_svd$d)), 2))
+colnames(var_per_PC_melt) <- c("Variance", "PC")
+
+require(ggplot2)
+
+Cairo(file = file.path(eda_dir, "variance_per_PC.pdf"), type = "pdf", units = "px", width = 1000, height = 1000, dpi = 90, bg = "white")
+var_per_PC_plot <- ggplot(var_per_PC_melt, aes(x = PC, y = Variance, ymax = 0.15)) + 
+  geom_point(size = 3) +
+  theme_bw() +
+  ylim(0, 100) +
+  ylab("Percentage from total variance") +
+  ggtitle("Variance explained per PC") +
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12))
+dev.off()
+
+PCA_df <- data.frame(PC1 = mvals_svd$u[,1], 
+                     PC2 = mvals_svd$u[,2], 
+                     Cohort = pData(gmset)$Phenotype, 
+                     Degree = pData(gmset)$Degree, 
+                     Passage = pData(gmset)$Passage, 
+                     Patient = pData(gmset)$Code)
+
+
+#PC1 and PC2: Color for patient, cohort per symbol and size per passage
+Cairo(file = file.path(eda_dir, "PC1_PC2_cohort_passage.pdf"), type = "pdf", units = "px", width = 1000, height = 1000, dpi = 90, bg = "white")
+ggplot(PCA_df, aes(x = PC1, y = PC2, color = Patient, shape = Cohort)) + 
+  geom_point(aes(size = Passage)) +
+  geom_line() +
+  theme_bw() +
+  ggtitle("PC1 vs PC2") +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+dev.off()
+
+#PC1 and PC2: Color for degree and size per passage
+ggplot(PCA_df, aes(x = PC1, y = PC2, color = Degree)) + 
+  geom_point(aes(size = Passage)) +
+  theme_bw() +
+  ggtitle("PC1 vs PC2") +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+```
+Overall, EDA shows that all samples derived from patient J47 behave differently from the rest. I will therefore remove J47 from the downstream analyses.
+```{r J47 removal, echo = F}
+J47_samples <- which(pData(gmset)$Code == "J47")
+gmset <- gmset[,-J47_samples]
+```
+
+Ensure that plots follow the same pattern: "Non_CD", "NINF", "INF", "STEN"
+```{r Rank Degree}
+pData(gmset)$Degree <- factor(pData(gmset)$Degree, levels = c("Non_CD", "NINF", "INF", "STEN"))
+```
+
+Generate a column in the sample data to include medication (aTNF and/or Thiopurine) usage
+```{r Medication usage}
+pData(gmset)$Medication <- NA
+medication_usage <- unique(c(which(pData(gmset)$Thiopurine == "Yes"), which(pData(gmset)$aTNF == "Yes")))
+pData(gmset)$Medication[medication_usage] <- T
+pData(gmset)$Medication[-medication_usage] <- F
+```
+
+```{r PCA}
+mvals <- getM(gmset)
+
+mvals_dm <- mvals-rowMeans(mvals)
+mvals_svd <- svd(t(mvals_dm))
+
+#Variance explained per PC
+var_per_PC <- mvals_svd$d/sum(mvals_svd$d)*100
+
+require(reshape2)
+var_per_PC_melt <- melt(var_per_PC)
+var_per_PC_melt <- cbind(var_per_PC_melt, rep(c(1:length(mvals_svd$d)), 2))
+colnames(var_per_PC_melt) <- c("Variance", "PC")
+
+require(ggplot2)
+
+var_per_PC_plot <- ggplot(var_per_PC_melt, aes(x = PC, y = Variance, ymax = 0.15)) + 
+  geom_point(size = 3) +
+  theme_bw() +
+  ylim(0, 100) +
+  ylab("Percentage from total variance") +
+  ggtitle("Variance explained per PC") +
+  theme(axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 12))
+
+var_per_PC_plot
+
+PCA_df <- data.frame(PC1 = mvals_svd$u[,1], 
+                     PC2 = mvals_svd$u[,2], 
+                     Cohort = pData(gmset)$Phenotype, 
+                     Degree = pData(gmset)$Degree, 
+                     Passage = pData(gmset)$Passage, 
+                     Patient = pData(gmset)$Code)
+
+#PC1 and PC2: Color for patient, cohort per symbol and size per passage
+Cairo(file = file.path(eda_dir, "PC1_PC2_culled_cohort_passage.pdf"), type = "pdf", units = "px", width = 1000, height = 1000, dpi = 90, bg = "white")
+ggplot(PCA_df, aes(x = PC1, y = PC2, color = Patient, shape = Degree)) + 
+  geom_point(aes(size = Passage)) +
+  geom_line() +
+  theme_bw() +
+  ggtitle("PC1 vs PC2") +
+  xlim(-0.5, 0.5) +
+  ylim(-0.5, 0.5) +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+dev.off()
+
+#ECD2016
+Cairo(file = file.path(eda_dir, "PC1_PC2_culled_passage_ECD2016.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+ggplot(PCA_df, aes(x = PC1, y = PC2, color = Degree, shape = Cohort)) + 
+  geom_point(size = 5) +
+  scale_color_manual(values = cbPalette) +
+  theme_bw() +
+  ggtitle("PC1 vs PC2") +
+  xlim(-0.5, 0.5) +
+  ylim(-0.5, 0.5) +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+dev.off()
+
+#Manuscript
+pca_plot_obj <- ggplot(PCA_df, aes(x = PC1, y = PC2)) + 
+  geom_point(aes(fill = Degree), color = "black", shape = 21, size = 5) +
+  #scale_color_manual(values = cbPalette) +
+  theme_bw() +
+  ggtitle("Methylation") +
+  xlim(-0.5, 0.5) +
+  ylim(-0.5, 0.5) +
+  ylab("PC2") +
+  xlab("PC1") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+Cairo(file = file.path(eda_dir, "PC1_PC2_culled_cohort_manuscript.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(pca_plot_obj)
+dev.off()
+```
+
+In the next step, we would want to quantify whether any of the confounders was affecting our data aversely.
+```{r PCA correlations}
+require(NDlib)
+require(rafalib)
+
+#Degree
+mvals_svd_degree <- SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Degree, padj.method = "bonferroni")
+
+degree_svd_df <- data.frame(PC1 = mvals_svd$u[,1], Degree = pData(gmset)$Degree)
+ggplot(degree_svd_df, aes(x = Degree, y = PC1)) +
+  geom_boxplot() + 
+  geom_jitter() +
+  theme_bw()
+
+#Gender
+mvals_svd_gender <- SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Gender, padj.method = "bonferroni")
+
+gender_svd_df <- data.frame(PC2 = mvals_svd$u[,2], Gender = pData(gmset)$Gender)
+ggplot(gender_svd_df, aes(x = Gender, y = PC2)) +
+  geom_boxplot() + 
+  geom_jitter() +
+  theme_bw()
+
+#Passage
+mvals_svd_passage <- SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Passage, padj.method = "bonferroni")
+Cairo(file = file.path(eda_dir, "SVD_passage_correlation.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+mvals_svd_passage
+dev.off()
+
+passage_svd_df <- data.frame(PC2 = mvals_svd$u[,2], Passage = as.fumeric(pData(gmset)$Passage))
+ggplot(passage_svd_df, aes(x = Passage, y = PC2)) +
+  geom_point() +
+  theme_bw()
+
+#Smoking
+SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Smoking)
+
+#Medication usage
+mvals_svd_medication <- SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Medication)
+
+#Age
+mvals_svd_age <- SVD_correlator(SVD = mvals_svd$u, confounder = pData(gmset)$Age)
+```
+
+As passage and degree appear to be the most interesting variables, we will look at their correlation with the principal components
+```{r PC Degree and Passage}
+svd_correlations_plot_df <- data.frame(Correlation = c(mvals_svd_degree[[1]]$Correlation, 
+                                                     mvals_svd_gender[[1]]$Correlation,
+                                                     mvals_svd_age[[1]]$Correlation,
+                                                     mvals_svd_passage[[1]]$Correlation,
+                                                     mvals_svd_medication[[1]]$Correlation),
+                                     Factor = rep(c("Degree", "Gender", "Age", "Passage", "Medication"), each = nrow(mvals_svd_degree[[1]])),
+                                     PC = rep(1:nrow(mvals_svd_degree[[1]]), 5)
+                                     )
+
+svd_correlations_plot_obj <- ggplot(svd_correlations_plot_df, aes(x = PC, y = Correlation, shape = Factor)) + 
+  geom_point(aes(fill = Factor), color = "black", shape = 21, size = 4) +
+  theme_bw() +
+  ggtitle("Methylation") +
+  geom_hline(yintercept = 0) +
+  ylim(-1, 1) +
+  xlab("PC") +
+  theme(plot.title = element_text(face = "bold"),
+        axis.title = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 12), 
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12),
+        legend.position = "bottom")
+
+Cairo(file = file.path(eda_dir, "SVD_methylation_correlations.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+svd_correlations_plot_obj
+dev.off()
+```
+
+Save the GMset for the future analyses and save the phenodata for future reference
+```{r save}
+gmset_dir <- file.path(output_dir, "gmset")
+dir.create(gmset_dir)
+saveRDS(gmset, file.path(gmset_dir, "GMset.Rds"))
+
+samples_dir <- file.path(output_dir, "samples_culled")
+dir.create(samples_dir)
+write.csv(pData(gmset), file.path(samples_dir, "samples_culled.csv"))
+```
+
+```{r Final}
+sessionInfo()
+today <- gsub("^([0-9]{4})-([0-9]{2})-([0-9]{2}).+$", "\\1\\2\\3", Sys.time())
+
+rdata_dir <- file.path(output_dir, "rdata")
+dir.create(rdata_dir)
+save.image(file = file.path(rdata_dir, paste0(today, ".RData")))
+```
+
+Data for the manuscript
+```{r Manuscript data}
+manuscript_dir <- file.path("manuscript")
+
+figure_dir <- file.path(manuscript_dir, "figures")
+table_dir <- file.path(manuscript_dir, "tables")
+
+#Figure 1 PCA methylation and expression
+figure_pca_dir <- file.path(figure_dir, "figure_1_PCA_methylation_and_expression")
+dir.create(figure_pca_dir)
+
+Cairo(file = file.path(figure_pca_dir, "PCA_methylation.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(pca_plot_obj)
+dev.off()
+
+#Figure S1 SVD correlations
+figure_pca_correlations_dir <- file.path(figure_dir, "figure_s1_SVD_correlations")
+dir.create(figure_pca_correlations_dir)
+
+Cairo(file = file.path(figure_pca_correlations_dir, "SVD_correlations.pdf"), type = "pdf", units = "px", width = 800, height = 800, dpi = 90, bg = "white")
+print(svd_correlations_plot_obj)
+dev.off()
+```
